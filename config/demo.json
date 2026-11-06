@@ -1,0 +1,22 @@
+{
+  "env": "demo-local",
+  "dsn": "artifacts/warehouse.sqlite3",
+  "checks": "checks/dq_checks.json",
+  "window_days": 30,
+  "fail_on": "P1",
+  "owner": "data-reliability@digital-habits.demo",
+  "sla_hours": {
+    "fct_account_turnover_daily": 26,
+    "fct_loan_portfolio_monthly": 24
+  },
+  "artifacts": {
+    "metrics": "artifacts/metrics/dq.prom",
+    "report": "artifacts/dq_report.md"
+  },
+  "notify": {
+    "channel": "#dq-alerts",
+    "jira_project": "DQ",
+    "dry_run": true
+  },
+  "params": {}
+}

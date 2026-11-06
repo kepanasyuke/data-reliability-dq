@@ -1,0 +1,148 @@
+{
+  "version": 3,
+  "owner_default": "data-reliability@digital-habits.demo",
+  "checks": [
+    {
+      "check_id": "turnover.freshness",
+      "title": "Свежесть загрузки оборотов",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P1",
+      "unit": "hours",
+      "bounds": { "fail": { "max": 26 }, "warn": { "max": 21 } },
+      "description": "Возраст последней успешной загрузки mart-слоя. SLA 26 часов: ночная загрузка + буфер на перезапуск.",
+      "sql": "SELECT ROUND({{ age_hours('last_load') }}, 3) AS metric_value, rows_loaded AS rows_examined FROM (SELECT MAX(load_dt) AS last_load, COUNT(*) AS rows_loaded FROM fct_account_turnover_daily) t",
+      "sample_sql": "SELECT entity, load_dt, rows_loaded, status FROM etl_batch ORDER BY load_dt DESC LIMIT 5",
+      "tags": ["freshness", "sla"]
+    },
+    {
+      "check_id": "loans.freshness",
+      "title": "Свежесть загрузки кредитного портфеля",
+      "entity": "fct_loan_portfolio_monthly",
+      "severity": "P2",
+      "unit": "hours",
+      "bounds": { "fail": { "max": 24 }, "warn": { "max": 20 } },
+      "description": "Портфель грузится раз в сутки; отставание больше суток ломает месячные дашборды по кредитному риску.",
+      "sql": "SELECT ROUND({{ age_hours('last_load') }}, 3) AS metric_value, rows_loaded AS rows_examined FROM (SELECT MAX(load_dt) AS last_load, COUNT(*) AS rows_loaded FROM fct_loan_portfolio_monthly) t",
+      "sample_sql": "SELECT entity, load_dt, rows_loaded, status FROM etl_batch WHERE entity = 'fct_loan_portfolio_monthly' ORDER BY load_dt DESC LIMIT 5",
+      "tags": ["freshness", "sla"]
+    },
+    {
+      "check_id": "client.inn.valid",
+      "title": "Контрольное число ИНН",
+      "entity": "dim_client",
+      "severity": "P1",
+      "unit": "ratio",
+      "validator": "inn_valid_ratio",
+      "bounds": { "fail": { "min": 0.995 }, "warn": { "min": 1.0 } },
+      "description": "Доля клиентов с корректным контрольным числом ИНН (10 знаков для ЮЛ, 12 для ИП). Ошибка здесь означает, что клиент не сматчится с внешними источниками и отчётностью ФНС.",
+      "tags": ["validity", "reference"]
+    },
+    {
+      "check_id": "client.ogrn.valid",
+      "title": "Контрольная цифра ОГРН",
+      "entity": "dim_client",
+      "severity": "P2",
+      "unit": "ratio",
+      "validator": "ogrn_valid_ratio",
+      "bounds": { "fail": { "min": 0.995 }, "warn": { "min": 1.0 } },
+      "description": "ОГРН (13 знаков) и ОГРНИП (15 знаков): проверка контрольной цифры по модулю 11/13.",
+      "tags": ["validity", "reference"]
+    },
+    {
+      "check_id": "client.segment.completeness",
+      "title": "Полнота сегмента клиента",
+      "entity": "dim_client",
+      "severity": "P2",
+      "unit": "ratio",
+      "bounds": { "fail": { "max": 0.05 }, "warn": { "max": 0.02 } },
+      "description": "Доля активных клиентов без сегмента. Дашборды режут отчёты по сегменту, поэтому пустой сегмент = потерянные строки в отчёте.",
+      "sql": "SELECT ROUND(AVG(CASE WHEN segment IS NULL OR TRIM(segment) = '' THEN 1.0 ELSE 0.0 END), 4) AS metric_value, COUNT(*) AS rows_examined FROM dim_client WHERE closed_dt IS NULL",
+      "sample_sql": "SELECT client_id, client_name, segment, manager_id FROM dim_client WHERE closed_dt IS NULL AND (segment IS NULL OR TRIM(segment) = '') LIMIT 5",
+      "tags": ["completeness"]
+    },
+    {
+      "check_id": "turnover.duplicate_grain",
+      "title": "Дубликаты гранулярности оборотов",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P2",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 } },
+      "description": "Grain факта - account_id + dt + currency. Дубликат завышает обороты и ломает оконные расчёты остатка.",
+      "sql": "SELECT COALESCE(SUM(cnt - 1), 0) AS metric_value, COUNT(*) AS rows_examined FROM (SELECT account_id, dt, currency, COUNT(*) AS cnt FROM fct_account_turnover_daily WHERE dt >= :window_start GROUP BY account_id, dt, currency HAVING COUNT(*) > 1) d",
+      "sample_sql": "SELECT account_id, dt, currency, COUNT(*) AS cnt FROM fct_account_turnover_daily WHERE dt >= :window_start GROUP BY account_id, dt, currency HAVING COUNT(*) > 1 ORDER BY cnt DESC LIMIT 5",
+      "tags": ["uniqueness", "grain"]
+    },
+    {
+      "check_id": "turnover.orphan_client",
+      "title": "Сироты по справочнику клиентов",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P1",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 } },
+      "description": "Обороты по client_id, которого нет в dim_client. Такие строки выпадают из всех отчётов по клиентам - молчаливая потеря выручки в аналитике.",
+      "sql": "SELECT COUNT(*) AS metric_value, (SELECT COUNT(*) FROM fct_account_turnover_daily WHERE dt >= :window_start) AS rows_examined FROM fct_account_turnover_daily t LEFT JOIN dim_client c ON c.client_id = t.client_id WHERE t.dt >= :window_start AND c.client_id IS NULL",
+      "sample_sql": "SELECT t.account_id, t.dt, t.client_id, t.debit_turnover, t.src_system FROM fct_account_turnover_daily t LEFT JOIN dim_client c ON c.client_id = t.client_id WHERE t.dt >= :window_start AND c.client_id IS NULL LIMIT 5",
+      "tags": ["integrity", "referential"]
+    },
+    {
+      "check_id": "turnover.balance_non_negative",
+      "title": "Отрицательный исходящий остаток",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P2",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 } },
+      "description": "Для расчётного счёта отрицательный остаток на конец дня - либо неучтённый овердрафт, либо ошибка знака при загрузке.",
+      "sql": "SELECT COUNT(*) AS metric_value, (SELECT COUNT(*) FROM fct_account_turnover_daily WHERE dt >= :window_start) AS rows_examined FROM fct_account_turnover_daily WHERE dt >= :window_start AND balance_eod < 0",
+      "sample_sql": "SELECT account_id, dt, currency, balance_eod, src_system FROM fct_account_turnover_daily WHERE dt >= :window_start AND balance_eod < 0 LIMIT 5",
+      "tags": ["validity", "business-rule"]
+    },
+    {
+      "check_id": "turnover.balance_continuity",
+      "title": "Непрерывность остатка",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P2",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 } },
+      "description": "Инвариант: balance_eod(dt) = balance_eod(dt-1) + credit_turnover - debit_turnover. Ловит пропущенные дни, задвоенные строки и молчаливый сдвиг остатка - то, что не видно в точечных проверках.",
+      "sql": "WITH ordered AS (SELECT account_id, dt, currency, balance_eod, debit_turnover, credit_turnover, LAG(balance_eod) OVER (PARTITION BY account_id, currency ORDER BY dt) AS prev_balance FROM fct_account_turnover_daily WHERE dt >= :window_start) SELECT COUNT(*) FILTER (WHERE prev_balance IS NOT NULL AND ABS(balance_eod - (prev_balance + credit_turnover - debit_turnover)) > 0.01) AS metric_value, COUNT(*) AS rows_examined FROM ordered",
+      "sample_sql": "WITH ordered AS (SELECT account_id, dt, currency, balance_eod, debit_turnover, credit_turnover, LAG(balance_eod) OVER (PARTITION BY account_id, currency ORDER BY dt) AS prev_balance FROM fct_account_turnover_daily WHERE dt >= :window_start) SELECT account_id, dt, prev_balance, credit_turnover, debit_turnover, balance_eod, ROUND(balance_eod - (prev_balance + credit_turnover - debit_turnover), 2) AS diff FROM ordered WHERE prev_balance IS NOT NULL AND ABS(balance_eod - (prev_balance + credit_turnover - debit_turnover)) > 0.01 ORDER BY ABS(balance_eod - (prev_balance + credit_turnover - debit_turnover)) DESC LIMIT 5",
+      "tags": ["reconciliation", "window-function"]
+    },
+    {
+      "check_id": "turnover.volume_anomaly",
+      "title": "Аномалия объёма загрузки",
+      "entity": "fct_account_turnover_daily",
+      "severity": "P1",
+      "unit": "ratio",
+      "bounds": { "fail": { "min": 0.7 }, "warn": { "min": 0.85 } },
+      "description": "Строк за последний день к медиане предыдущих 7 дней. Ловит частичную загрузку (упал источник, обрезался файл), когда свежесть формально в норме.",
+      "sql": "WITH daily AS (SELECT dt, COUNT(*) AS cnt FROM fct_account_turnover_daily GROUP BY dt), scored AS (SELECT dt, cnt, AVG(cnt) OVER (ORDER BY dt ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS baseline, ROW_NUMBER() OVER (ORDER BY dt DESC) AS rn FROM daily) SELECT COALESCE(ROUND(cnt * 1.0 / NULLIF(baseline, 0), 4), 0) AS metric_value, cnt AS rows_examined FROM scored WHERE rn = 1",
+      "sample_sql": "SELECT dt, COUNT(*) AS rows_loaded FROM fct_account_turnover_daily GROUP BY dt ORDER BY dt DESC LIMIT 8",
+      "tags": ["volume", "anomaly-detection"]
+    },
+    {
+      "check_id": "loans.debt_within_limit",
+      "title": "Долг в пределах лимита",
+      "entity": "fct_loan_portfolio_monthly",
+      "severity": "P2",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 } },
+      "description": "Бизнес-инвариант портфеля: debt_amt не может превышать одобренный limit_amt. Нарушение = либо ошибка загрузки, либо неучтённое изменение лимита.",
+      "sql": "SELECT COUNT(*) AS metric_value, (SELECT COUNT(*) FROM fct_loan_portfolio_monthly) AS rows_examined FROM fct_loan_portfolio_monthly WHERE debt_amt > limit_amt + 0.01",
+      "sample_sql": "SELECT client_id, product_code, month, limit_amt, debt_amt, ROUND(debt_amt - limit_amt, 2) AS excess FROM fct_loan_portfolio_monthly WHERE debt_amt > limit_amt + 0.01 ORDER BY excess DESC LIMIT 5",
+      "tags": ["business-rule", "portfolio"]
+    },
+    {
+      "check_id": "batch.rowcount_match",
+      "title": "Сверка rowcount с метаданными загрузки",
+      "entity": "etl_batch",
+      "severity": "P3",
+      "unit": "count",
+      "bounds": { "fail": { "max": 0 }, "warn": { "max": 50 } },
+      "description": "rows_loaded из ops.etl_batch против фактического COUNT(*) в mart. Ловит потери при merge/upsert и загрузки, которые 'отчитались' об успехе.",
+      "sql": "WITH last_batch AS (SELECT entity, load_dt, rows_loaded, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY load_dt DESC) AS rn FROM etl_batch WHERE status = 'SUCCESS'), actual AS (SELECT 'fct_account_turnover_daily' AS entity, COUNT(*) AS cnt FROM fct_account_turnover_daily UNION ALL SELECT 'fct_loan_portfolio_monthly', COUNT(*) FROM fct_loan_portfolio_monthly) SELECT ABS(lb.rows_loaded - a.cnt) AS metric_value, a.cnt AS rows_examined FROM last_batch lb JOIN actual a ON a.entity = lb.entity WHERE lb.rn = 1 ORDER BY metric_value DESC LIMIT 1",
+      "sample_sql": "WITH last_batch AS (SELECT entity, load_dt, rows_loaded, ROW_NUMBER() OVER (PARTITION BY entity ORDER BY load_dt DESC) AS rn FROM etl_batch WHERE status = 'SUCCESS'), actual AS (SELECT 'fct_account_turnover_daily' AS entity, COUNT(*) AS cnt FROM fct_account_turnover_daily UNION ALL SELECT 'fct_loan_portfolio_monthly', COUNT(*) FROM fct_loan_portfolio_monthly) SELECT lb.entity, lb.load_dt, lb.rows_loaded, a.cnt AS actual_rows, lb.rows_loaded - a.cnt AS delta FROM last_batch lb JOIN actual a ON a.entity = lb.entity WHERE lb.rn = 1 ORDER BY ABS(lb.rows_loaded - a.cnt) DESC LIMIT 5",
+      "tags": ["reconciliation", "etl"]
+    }
+  ]
+}
