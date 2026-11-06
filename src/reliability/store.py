@@ -85,17 +85,18 @@ def save_results(
         )
         for result in results
     ]
-    if not payload:
-        return 0
-    return db.executemany(
+    written = 0
+    if payload:
+        written = db.executemany(
         """
         INSERT INTO ops_dq_result
             (run_id, run_ts, check_id, entity, severity, status, metric_value,
              unit, message, rows_examined, duration_ms, samples_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        payload,
-    )
+            """,
+            payload,
+        )
+    return written
 
 
 def latest_run_id(db: Database) -> str | None:

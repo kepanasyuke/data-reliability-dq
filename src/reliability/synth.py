@@ -40,19 +40,23 @@ SRC_SYSTEMS = ["ABS_CORE", "ABS_CORE", "ABS_CORE", "CRM", "DWH_STAGE"]
 def make_inn(rng: random.Random, legal_entity: bool = True) -> str:
     if legal_entity:
         prefix = "".join(str(rng.randint(0, 9)) for _ in range(9))
-        return prefix + str(_inn_checksum(prefix, INN_WEIGHTS_10))
-    prefix = "".join(str(rng.randint(0, 9)) for _ in range(10))
-    d11 = _inn_checksum(prefix, INN_WEIGHTS_11)
-    d12 = _inn_checksum(prefix + str(d11), INN_WEIGHTS_12)
-    return prefix + str(d11) + str(d12)
+        inn = prefix + str(_inn_checksum(prefix, INN_WEIGHTS_10))
+    else:
+        prefix = "".join(str(rng.randint(0, 9)) for _ in range(10))
+        d11 = _inn_checksum(prefix, INN_WEIGHTS_11)
+        d12 = _inn_checksum(prefix + str(d11), INN_WEIGHTS_12)
+        inn = prefix + str(d11) + str(d12)
+    return inn
 
 
 def make_ogrn(rng: random.Random, legal_entity: bool = True) -> str:
     if legal_entity:
         prefix = "1" + "".join(str(rng.randint(0, 9)) for _ in range(11))
-        return prefix + str(int(prefix) % 11 % 10)
-    prefix = "3" + "".join(str(rng.randint(0, 9)) for _ in range(13))
-    return prefix + str(int(prefix) % 13 % 10)
+        ogrn = prefix + str(int(prefix) % 11 % 10)
+    else:
+        prefix = "3" + "".join(str(rng.randint(0, 9)) for _ in range(13))
+        ogrn = prefix + str(int(prefix) % 13 % 10)
+    return ogrn
 
 
 def _iso(moment: datetime) -> str:

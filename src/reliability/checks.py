@@ -87,24 +87,27 @@ class CheckResult:
 
 
 def _violates(bound: Mapping[str, float], value: float) -> bool:
-    for operator, threshold in bound.items():
-        if operator == "max" and value > float(threshold):
-            return True
-        if operator == "min" and value < float(threshold):
-            return True
-        if operator == "eq" and value != float(threshold):
-            return True
-    return False
+    def exceeded(operator: str, threshold: float) -> bool:
+        comparisons = {
+            "max": value > threshold,
+            "min": value < threshold,
+            "eq": value != threshold,
+        }
+        return comparisons.get(operator, False)
+
+    return any(exceeded(operator, float(threshold)) for operator, threshold in bound.items())
 
 
 def evaluate(spec: CheckSpec, value: float) -> str:
     """Map a metric value to PASS/WARN/FAIL using the spec bounds."""
-    if _violates(spec.fail_bound, value):
-        return FAIL
     warn_bound = spec.bounds.get("warn")
-    if warn_bound and _violates(warn_bound, value):
-        return WARN
-    return PASS
+    if _violates(spec.fail_bound, value):
+        status = FAIL
+    elif warn_bound and _violates(warn_bound, value):
+        status = WARN
+    else:
+        status = PASS
+    return status
 
 
 def _describe_bound(bound: Mapping[str, float]) -> str:
@@ -173,75 +176,69 @@ class CheckRunner:
     def _execute(self, spec: CheckSpec, params: Mapping[str, Any]) -> dict[str, Any]:
         if spec.validator:
             handler: Callable[[Database, Mapping[str, Any]], dict[str, Any]] = VALIDATORS[spec.validator]
-            return handler(self.db, params)
-        assert spec.sql is not None
-        rows = self.db.query(spec.sql, params)
-        if not rows:
-            return {"metric_value": None, "message": "query returned no rows"}
-        return rows[0]
+            row = handler(self.db, params)
+        else:
+            rows = self.db.query(spec.sql or "", params)
+            row = rows[0] if rows else {"metric_value": None, "message": "query returned no rows"}
+        return row
 
     def _samples(self, spec: CheckSpec, params: Mapping[str, Any]) -> list[dict[str, Any]]:
-        if not spec.sample_sql:
-            return []
-        try:
-            rows = self.db.query(spec.sample_sql, params)
-        except Exception as exc:  # samples must never break a run
-            return [{"sample_error": str(exc)}]
-        return rows[: self.sample_limit]
+        samples: list[dict[str, Any]] = []
+        if spec.sample_sql:
+            try:
+                samples = self.db.query(spec.sample_sql, params)[: self.sample_limit]
+            except Exception as exc:  # samples must never break a run
+                samples = [{"sample_error": str(exc)}]
+        return samples
 
     def run_check(self, spec: CheckSpec) -> CheckResult:
         params = {**self.runtime_params, **spec.params}
         started = datetime.now(timezone.utc)
         clock = time.perf_counter()
+        common = {
+            "check_id": spec.check_id,
+            "title": spec.title,
+            "entity": spec.entity,
+            "severity": spec.severity,
+            "owner": spec.owner,
+            "unit": spec.unit,
+            "bounds": spec.bounds,
+            "started_at": started.isoformat(timespec="seconds"),
+        }
         try:
             row = self._execute(spec, params)
-            raw_value = row.get("metric_value")
-            message = row.get("message")
-            rows_examined = row.get("rows_examined")
         except Exception as exc:
-            return CheckResult(
-                check_id=spec.check_id,
-                title=spec.title,
-                entity=spec.entity,
-                severity=spec.severity,
-                owner=spec.owner,
+            result = CheckResult(
                 status=ERROR,
                 metric_value=None,
-                unit=spec.unit,
-                bounds=spec.bounds,
                 message=f"check failed to execute: {exc}",
                 duration_ms=int((time.perf_counter() - clock) * 1000),
-                started_at=started.isoformat(timespec="seconds"),
+                **common,
             )
-
-        if raw_value is None:
-            status = FAIL
-            value: float | None = None
-            message = message or "metric is null - source table looks empty or stale"
         else:
-            value = float(raw_value)
-            status = evaluate(spec, value)
-            message = message or (
-                f"{spec.unit}: {value:g} (threshold {_describe_bound(spec.bounds['fail'])})"
+            raw_value = row.get("metric_value")
+            message = row.get("message") or ""
+            rows_examined = row.get("rows_examined")
+            if raw_value is None:
+                status = FAIL
+                value: float | None = None
+                message = message or "metric is null - source table looks empty or stale"
+            else:
+                value = float(raw_value)
+                status = evaluate(spec, value)
+                message = message or (
+                    f"{spec.unit}: {value:g} (threshold {_describe_bound(spec.bounds['fail'])})"
+                )
+            result = CheckResult(
+                status=status,
+                metric_value=value,
+                message=message,
+                rows_examined=int(rows_examined) if rows_examined is not None else None,
+                duration_ms=int((time.perf_counter() - clock) * 1000),
+                samples=self._samples(spec, params) if status != PASS else [],
+                **common,
             )
-
-        samples = self._samples(spec, params) if status != PASS else []
-        return CheckResult(
-            check_id=spec.check_id,
-            title=spec.title,
-            entity=spec.entity,
-            severity=spec.severity,
-            owner=spec.owner,
-            status=status,
-            metric_value=value,
-            unit=spec.unit,
-            bounds=spec.bounds,
-            message=message,
-            rows_examined=int(rows_examined) if rows_examined is not None else None,
-            duration_ms=int((time.perf_counter() - clock) * 1000),
-            started_at=started.isoformat(timespec="seconds"),
-            samples=samples,
-        )
+        return result
 
     def run(self) -> list[CheckResult]:
         """Run every check; the worst status wins for the run overall."""
@@ -269,7 +266,7 @@ def exit_code(results: Iterable[CheckResult], fail_on: str = "P1") -> int:
         for r in results
         if r.failed and SEVERITY_ORDER[r.severity] <= floor
     ]
-    if not breached:
-        return 0
-    worst_severity = min(SEVERITY_ORDER[r.severity] for r in breached)
-    return worst_severity + 1
+    code = 0
+    if breached:
+        code = min(SEVERITY_ORDER[r.severity] for r in breached) + 1
+    return code

@@ -86,11 +86,12 @@ class Database:
             cursor = self._conn.cursor(cursor_factory=self._cursor_factory)
             try:
                 cursor.execute(statement, values)
-                return [dict(row) for row in cursor.fetchall()]
+                rows = [dict(row) for row in cursor.fetchall()]
             finally:
                 cursor.close()
-        cursor = self._conn.execute(statement, values)
-        return [dict(row) for row in cursor.fetchall()]
+        else:
+            rows = [dict(row) for row in self._conn.execute(statement, values).fetchall()]
+        return rows
 
     def query_one(
         self, sql: str, params: Mapping[str, Any] | None = None
@@ -102,9 +103,7 @@ class Database:
         self, sql: str, params: Mapping[str, Any] | None = None, default: Any = None
     ) -> Any:
         row = self.query_one(sql, params)
-        if not row:
-            return default
-        return next(iter(row.values()))
+        return next(iter(row.values())) if row else default
 
     # -- writing -----------------------------------------------------------
     def execute(self, sql: str, params: Mapping[str, Any] | None = None) -> None:
@@ -127,13 +126,14 @@ class Database:
             cursor = self._conn.cursor()
             try:
                 cursor.executemany(statement, list(rows))
-                self._conn.commit()
-                return cursor.rowcount
+                written = cursor.rowcount
             finally:
                 cursor.close()
-        cursor = self._conn.executemany(statement, rows)
-        self._conn.commit()
-        return cursor.rowcount
+            self._conn.commit()
+        else:
+            written = self._conn.executemany(statement, rows).rowcount
+            self._conn.commit()
+        return written
 
     def script(self, path: str | Path) -> None:
         """Run a .sql file (DDL). SQLite uses executescript, PG splits on ';'."""

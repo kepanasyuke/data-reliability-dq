@@ -27,47 +27,46 @@ def _inn_checksum(digits: str, weights: tuple[int, ...]) -> int:
 
 def inn_valid(inn: str | None) -> bool:
     """Validate a Russian INN: 10 digits for legal entities, 12 for sole traders."""
-    if not inn:
-        return False
-    value = str(inn).strip()
-    if not value.isdigit():
-        return False
-    if len(value) == 10:
-        return _inn_checksum(value[:9], INN_WEIGHTS_10) == int(value[9])
-    if len(value) == 12:
-        first = _inn_checksum(value[:10], INN_WEIGHTS_11) == int(value[10])
-        second = _inn_checksum(value[:11], INN_WEIGHTS_12) == int(value[11])
-        return first and second
-    return False
+    value = str(inn).strip() if inn else ""
+    valid = False
+    if value.isdigit():
+        if len(value) == 10:
+            valid = _inn_checksum(value[:9], INN_WEIGHTS_10) == int(value[9])
+        elif len(value) == 12:
+            valid = (
+                _inn_checksum(value[:10], INN_WEIGHTS_11) == int(value[10])
+                and _inn_checksum(value[:11], INN_WEIGHTS_12) == int(value[11])
+            )
+    return valid
 
 
 def ogrn_valid(ogrn: str | None) -> bool:
     """Validate a Russian OGRN (13 digits) / OGRNIP (15 digits) control digit."""
-    if not ogrn:
-        return False
-    value = str(ogrn).strip()
-    if not value.isdigit():
-        return False
-    if len(value) == 13:
-        return int(value[:12]) % 11 % 10 == int(value[12])
-    if len(value) == 15:
-        return int(value[:14]) % 13 % 10 == int(value[14])
-    return False
+    value = str(ogrn).strip() if ogrn else ""
+    valid = False
+    if value.isdigit():
+        if len(value) == 13:
+            valid = int(value[:12]) % 11 % 10 == int(value[12])
+        elif len(value) == 15:
+            valid = int(value[:14]) % 13 % 10 == int(value[14])
+    return valid
 
 
 def _ratio_report(values: list[str], predicate: Callable[[str], bool]) -> dict[str, Any]:
-    if not values:
-        return {
+    if values:
+        valid = sum(1 for value in values if predicate(value))
+        report = {
+            "metric_value": round(valid / len(values), 6),
+            "rows_examined": len(values),
+            "message": f"{len(values) - valid} of {len(values)} values failed the checksum",
+        }
+    else:
+        report = {
             "metric_value": 0.0,
             "rows_examined": 0,
             "message": "no reference data to validate",
         }
-    valid = sum(1 for value in values if predicate(value))
-    return {
-        "metric_value": round(valid / len(values), 6),
-        "rows_examined": len(values),
-        "message": f"{len(values) - valid} of {len(values)} values failed the checksum",
-    }
+    return report
 
 
 def inn_valid_ratio(db: Database, params: Mapping[str, Any]) -> dict[str, Any]:

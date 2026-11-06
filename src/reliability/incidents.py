@@ -35,10 +35,10 @@ def _iso(moment: datetime) -> str:
 
 
 def _parse(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def dedup_key(check_id: str, entity: str) -> str:
@@ -236,10 +236,11 @@ def _require(db: Database, incident_id: str) -> dict[str, Any]:
 
 def age_minutes(incident: Mapping[str, Any], now: datetime | None = None) -> float:
     opened = _parse(incident.get("opened_at"))
-    if not opened:
-        return 0.0
-    end = _parse(incident.get("resolved_at")) or (now or _now())
-    return round((end - opened).total_seconds() / 60.0, 1)
+    minutes = 0.0
+    if opened:
+        end = _parse(incident.get("resolved_at")) or (now or _now())
+        minutes = round((end - opened).total_seconds() / 60.0, 1)
+    return minutes
 
 
 def mttr(db: Database) -> dict[str, Any]:
@@ -259,13 +260,15 @@ def mttr(db: Database) -> dict[str, Any]:
         per_severity.setdefault(row["severity"], []).append(minutes)
 
     def summarize(values: list[float]) -> dict[str, Any]:
-        if not values:
-            return {"resolved": 0, "avg_minutes": None, "max_minutes": None}
-        return {
-            "resolved": len(values),
-            "avg_minutes": round(sum(values) / len(values), 1),
-            "max_minutes": round(max(values), 1),
-        }
+        if values:
+            summary = {
+                "resolved": len(values),
+                "avg_minutes": round(sum(values) / len(values), 1),
+                "max_minutes": round(max(values), 1),
+            }
+        else:
+            summary = {"resolved": 0, "avg_minutes": None, "max_minutes": None}
+        return summary
 
     return {
         "overall": summarize(durations),

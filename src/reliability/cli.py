@@ -279,15 +279,17 @@ def cmd_report(config: Config, args: argparse.Namespace) -> int:
     with Database(config.database_path) as db:
         store.ensure_schema(db)
         run_id = store.latest_run_id(db)
-        if not run_id:
-            print("нет ни одного прогона — выполните `run`")
-            return 1
-        rows = store.results_for_run(db, run_id)
-    print(f"последний прогон {run_id}: {len(rows)} проверок, отчёт {config.report_path}")
-    for row in rows:
-        if row["status"] in ("FAIL", "ERROR"):
-            print(f"  {STATUS_MARK[row['status']]} {row['severity']} {row['check_id']}: {row['message']}")
-    return 0
+        rows = store.results_for_run(db, run_id) if run_id else []
+    if not run_id:
+        print("нет ни одного прогона — выполните `run`")
+        code = 1
+    else:
+        print(f"последний прогон {run_id}: {len(rows)} проверок, отчёт {config.report_path}")
+        for row in rows:
+            if row["status"] in ("FAIL", "ERROR"):
+                print(f"  {STATUS_MARK[row['status']]} {row['severity']} {row['check_id']}: {row['message']}")
+        code = 0
+    return code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -331,13 +333,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config(args.config)
     try:
-        return int(args.func(config, args))
-    except KeyError as exc:
+        code = int(args.func(config, args))
+    except (KeyError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        print(f"ошибка: {exc}", file=sys.stderr)
-        return 2
+        code = 2
+    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

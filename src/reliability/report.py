@@ -26,14 +26,16 @@ class ReportContext:
 
 def _fmt(value: float | None, unit: str) -> str:
     if value is None:
-        return "-"
-    if unit == "ratio":
-        return f"{value:.4f}"
-    if unit == "hours":
-        return f"{value:.2f} h"
-    if unit == "row_pct":
-        return f"{value:.2f}"
-    return f"{value:g}"
+        text = "-"
+    elif unit == "ratio":
+        text = f"{value:.4f}"
+    elif unit == "hours":
+        text = f"{value:.2f} h"
+    elif unit == "row_pct":
+        text = f"{value:.2f}"
+    else:
+        text = f"{value:g}"
+    return text
 
 
 def _bound(bounds: Mapping[str, Mapping[str, float]]) -> str:

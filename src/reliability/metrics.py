@@ -34,10 +34,9 @@ def _escape(value: object) -> str:
 
 
 def _labels(**labels: object) -> str:
-    if not labels:
-        return ""
+    """Пустой набор меток не даёт фигурных скобок - иначе Prometheus ругается."""
     inner = ",".join(f'{key}="{_escape(val)}"' for key, val in labels.items())
-    return "{" + inner + "}"
+    return "{" + inner + "}" if inner else ""
 
 
 def render(

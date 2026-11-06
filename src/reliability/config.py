@@ -29,11 +29,11 @@ class Config:
     def database_path(self) -> str:
         """DSN usable by ``Database``; relative SQLite paths resolve to root."""
         if self.dsn.startswith(("postgres://", "postgresql://", ":memory:")):
-            return self.dsn
-        candidate = Path(self.dsn)
-        if not candidate.is_absolute():
-            candidate = self.root / candidate
-        return str(candidate)
+            path = self.dsn
+        else:
+            candidate = Path(self.dsn)
+            path = str(candidate if candidate.is_absolute() else self.root / candidate)
+        return path
 
     def sla_for(self, entity: str, default: float = 24.0) -> float:
         return float(self.sla_hours.get(entity, default))
