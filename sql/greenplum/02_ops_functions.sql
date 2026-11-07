@@ -81,7 +81,8 @@ BEGIN
                metric_value = p_metric,
                latest_run_id = p_run_id,
                samples_json = COALESCE(p_samples, samples_json)
-         WHERE incident_id = v_existing.incident_id;
+         WHERE incident_id = v_existing.incident_id
+           AND dedup_key   = v_key;
 
         RETURN v_existing.incident_id;
     END IF;

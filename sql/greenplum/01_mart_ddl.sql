@@ -4,6 +4,16 @@
 --  Файл показывает, как устроен mart-слой и какие решения по
 --  распределению/партиционированию принимались - это первое, что
 --  проверяют на ревью в MPP.
+--
+--  Правила Greenplum, которые здесь соблюдены (иначе DDL падает):
+--   1) все колонки DISTRIBUTED BY обязаны входить в PRIMARY KEY/UNIQUE
+--      (распределённая таблица не может гарантировать глобальную
+--      уникальность по колонке, которой нет в ключе распределения);
+--   2) ключом RANGE-партиции может быть date/timestamp/число, но не
+--      varchar - поэтому месяц портфеля хранится как date (первое число),
+--      а не как строка 'YYYY-MM' из демо-схемы на SQLite;
+--   3) compresstype = zstd требует Greenplum 6.4+ (в 6.0-6.3 - только
+--      zlib/quicklz/RLE).
 -- =====================================================================
 
 CREATE SCHEMA IF NOT EXISTS mart;
@@ -82,11 +92,15 @@ CREATE INDEX idx_turnover_client ON mart.fct_account_turnover_daily (client_id);
 -- Месячный портфель кредитных продуктов.
 -- Grain: client_id + product_code + month. Распределение по client_id -
 -- отчёты агрегируют портфель по клиенту, а не по продукту.
+-- month - тип date (первое число месяца): ключ RANGE-партиции в
+-- Greenplum должен быть date/timestamp/числом. В демо на SQLite это
+-- строка 'YYYY-MM'; при выгрузке из демо в GP поле конвертируется
+-- (month || '-01')::date, обратно - to_char(month, 'YYYY-MM').
 -- ---------------------------------------------------------------------
 CREATE TABLE mart.fct_loan_portfolio_monthly (
     client_id     varchar(20)   NOT NULL,
     product_code  varchar(32)   NOT NULL,
-    month         varchar(7)    NOT NULL,
+    month         date          NOT NULL,
     limit_amt     numeric(20,2) NOT NULL DEFAULT 0,
     debt_amt      numeric(20,2) NOT NULL DEFAULT 0,
     overdue_amt   numeric(20,2) NOT NULL DEFAULT 0,
@@ -97,9 +111,9 @@ WITH (appendonly = true, orientation = column, compresstype = zstd)
 DISTRIBUTED BY (client_id)
 PARTITION BY RANGE (month)
 (
-    START ('2024-01') INCLUSIVE
-    END ('2027-01') EXCLUSIVE
-    EVERY ('1 mon'),
+    START (DATE '2024-01-01') INCLUSIVE
+    END (DATE '2027-01-01') EXCLUSIVE
+    EVERY (INTERVAL '1 month'),
     DEFAULT PARTITION p_default
 );
 
@@ -107,6 +121,11 @@ PARTITION BY RANGE (month)
 -- Метаданные загрузок: единственный источник правды о том, что и когда
 -- приехало. Проверки свежести и сверки rowcount смотрят сюда, а не в
 -- system catalog - так они одинаково работают для Greenplum и ClickHouse.
+-- PK составной (batch_id, entity): entity - ключ распределения, а
+-- Greenplum требует, чтобы все колонки DISTRIBUTED BY входили в PK.
+-- Глобальная уникальность batch_id обеспечивается загрузчиком
+-- (batch_id = entity + run_ts), отдельный UNIQUE здесь невозможен:
+-- он тоже обязан содержать entity.
 -- ---------------------------------------------------------------------
 CREATE TABLE ops.etl_batch (
     batch_id    varchar(40) NOT NULL,
@@ -115,7 +134,7 @@ CREATE TABLE ops.etl_batch (
     load_dt     timestamp   NOT NULL,
     rows_loaded bigint      NOT NULL DEFAULT 0,
     status      varchar(20) NOT NULL DEFAULT 'SUCCESS',
-    CONSTRAINT etl_batch_pk PRIMARY KEY (batch_id)
+    CONSTRAINT etl_batch_pk PRIMARY KEY (batch_id, entity)
 )
 DISTRIBUTED BY (entity);
 
@@ -139,6 +158,12 @@ CREATE TABLE ops.dq_result (
 )
 DISTRIBUTED BY (check_id);
 
+-- Инциденты. Распределены по dedup_key: и открытие, и продление, и
+-- автозакрытие идут предикатом WHERE dedup_key = ..., поэтому строка
+-- истории инцидента всегда лежит на одном сегменте.
+-- PK составной (incident_id, dedup_key) - по тому же правилу Greenplum,
+-- что и у ops.etl_batch: ключ распределения обязан быть в PK.
+-- ---------------------------------------------------------------------
 CREATE TABLE ops.dq_incident (
     incident_id     varchar(20) NOT NULL,
     dedup_key       varchar(200) NOT NULL,
@@ -158,7 +183,7 @@ CREATE TABLE ops.dq_incident (
     bounds_json     text,
     samples_json    text,
     resolution_note text,
-    CONSTRAINT dq_incident_pk PRIMARY KEY (incident_id)
+    CONSTRAINT dq_incident_pk PRIMARY KEY (incident_id, dedup_key)
 )
 DISTRIBUTED BY (dedup_key);
 
