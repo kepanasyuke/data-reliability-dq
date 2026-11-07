@@ -84,27 +84,42 @@ SELECT COUNT(*) FILTER (
   FROM ordered;
 
 -- 7. Аномалия объёма: последний день против медианы предыдущих 7 дней.
---    percentile_cont - оконная агрегатная функция, допустима в GP 6+;
---    на GP 5 пришлось бы считать через ntile.
+--    percentile_cont как оконная функция на Greenplum 6 не работает
+--    ("OVER is not supported for ordered-set aggregate percentile_cont"),
+--    поэтому медиана считается ранговым способом: берём две средние
+--    строки окна и усредняем - результат тот же, стоимость ниже.
 WITH daily AS (
     SELECT dt, COUNT(*) AS cnt
       FROM mart.fct_account_turnover_daily
      WHERE dt >= current_date - 15
      GROUP BY dt
 ),
-scored AS (
+pairs AS (
+    SELECT d.dt, d.cnt, p.cnt AS prev_cnt
+      FROM daily d
+      JOIN daily p ON p.dt BETWEEN d.dt - 7 AND d.dt - 1
+),
+ranked AS (
     SELECT dt,
            cnt,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY cnt)
-               OVER (ORDER BY dt ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS median_prev,
-           ROW_NUMBER() OVER (ORDER BY dt DESC) AS rn
-      FROM daily
+           prev_cnt,
+           ROW_NUMBER() OVER (PARTITION BY dt ORDER BY prev_cnt) AS rn,
+           COUNT(*)     OVER (PARTITION BY dt)                   AS n
+      FROM pairs
+),
+med AS (
+    SELECT dt, AVG(prev_cnt) AS median_prev
+      FROM ranked
+     WHERE rn IN ((n + 1) / 2, (n + 2) / 2)
+     GROUP BY dt
 )
-SELECT ROUND(cnt::numeric / NULLIF(median_prev, 0), 4) AS metric_value,
-       cnt AS rows_examined,
-       median_prev
-  FROM scored
- WHERE rn = 1;
+SELECT ROUND(r.cnt::numeric / NULLIF(m.median_prev, 0), 4) AS metric_value,
+       r.cnt                                               AS rows_examined,
+       m.median_prev
+  FROM daily r
+  LEFT JOIN med m ON m.dt = r.dt
+ ORDER BY r.dt DESC
+ LIMIT 1;
 
 -- 8. Полнота атрибута segment по активным клиентам (P2).
 SELECT ROUND(
