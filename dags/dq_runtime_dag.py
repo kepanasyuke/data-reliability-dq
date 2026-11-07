@@ -70,6 +70,77 @@ def _on_sla_miss(dag, dag_run, tasks, blocking_tis):  # pragma: no cover - Airfl
     send_email(to=ALERT_RECIPIENTS, subject=f"[DQ SLA MISS] {dag.dag_id}", html_content=body)
 
 
+def _runtime_params(context: dict, config) -> dict:
+    run_date = datetime.fromisoformat(context["ds"])
+    return {
+        "run_ts": context["ts"],
+        "run_date": context["ds"],
+        "window_start": (run_date - timedelta(days=config.window_days)).date().isoformat(),
+        "window_days": config.window_days,
+        **config.params,
+    }
+
+
+def _results_from_store(db: Database, run_id: str, owner: str) -> list:
+    from reliability.checks import CheckResult  # local import: keep DAG parse light
+
+    return [
+        CheckResult(
+            check_id=row["check_id"],
+            title=row["check_id"],
+            entity=row["entity"],
+            severity=row["severity"],
+            owner=owner,
+            status=row["status"],
+            metric_value=row["metric_value"],
+            unit=row["unit"] or "count",
+            bounds={},
+            message=row["message"] or "",
+            rows_examined=row["rows_examined"],
+            duration_ms=row["duration_ms"] or 0,
+        )
+        for row in store.results_for_run(db, run_id)
+    ]
+
+
+def _open_incident_counts(db: Database) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for incident in incidents.open_incidents(db):
+        counts[incident["severity"]] = counts.get(incident["severity"], 0) + 1
+    return counts
+
+
+def _summary(run_id: str, results, events, payload, config) -> dict:
+    return {
+        "run_id": run_id,
+        "exit_code": exit_code(results, config.fail_on),
+        "failed": [r.check_id for r in results if r.failed],
+        "p1_failed": [r.check_id for r in results if r.failed and r.severity in P1_SEVERITIES],
+        "events": len(events),
+        "notify": payload,
+        "results": [r.as_dict() for r in results],
+    }
+
+
+def _log_summary(summary: dict) -> None:
+    log.info("DQ run %s: %s", summary["run_id"], json.dumps(summary["results"], ensure_ascii=False))
+    if summary["exit_code"] >= 1:
+        log.warning("P1 breach: %s", summary["p1_failed"])
+
+
+def _report_context(db: Database, config, run_id: str) -> report.ReportContext:
+    return report.ReportContext(
+        env=config.env,
+        run_id=run_id,
+        run_ts=datetime.now(),
+        results=_results_from_store(db, run_id, config.owner),
+        incidents=incidents.open_incidents(db),
+        mttr=incidents.mttr(db),
+        sla_breaches=incidents.sla_breaches(db),
+        history=store.runs_history(db),
+    )
+
+
 with DAG(
     dag_id="dq_runtime_mart",
     description="DQ-проверки mart-слоя аналитического хранилища + синхронизация инцидентов",
@@ -100,36 +171,13 @@ with DAG(
         with Database(config.database_path) as db:
             store.ensure_schema(db)
             specs = load_checks(config.checks_path)
-            runner = CheckRunner(
-                db,
-                specs,
-                runtime_params={
-                    "run_ts": context["ts"],
-                    "run_date": context["ds"],
-                    "window_start": (
-                        datetime.fromisoformat(context["ds"]) - timedelta(days=config.window_days)
-                    ).date().isoformat(),
-                    "window_days": config.window_days,
-                    **config.params,
-                },
-            )
+            runner = CheckRunner(db, specs, _runtime_params(context, config))
             results = runner.run()
             store.save_results(db, run_id, context["ts"], results)
             events = incidents.sync_incidents(db, run_id, results, config.owner)
             payload = incidents.notification_payload(events, run_id, config.notify)
-
-            summary = {
-                "run_id": run_id,
-                "exit_code": exit_code(results, config.fail_on),
-                "failed": [r.check_id for r in results if r.failed],
-                "p1_failed": [r.check_id for r in results if r.failed and r.severity in P1_SEVERITIES],
-                "events": len(events),
-                "notify": payload,
-                "results": [r.as_dict() for r in results],
-            }
-        log.info("DQ run %s: %s", run_id, json.dumps(summary["results"], ensure_ascii=False))
-        if summary["exit_code"] >= 1:
-            log.warning("P1 breach: %s", summary["p1_failed"])
+            summary = _summary(run_id, results, events, payload, config)
+        _log_summary(summary)
         return summary
 
     @task(task_id="export_metrics", trigger_rule="all_done")
@@ -137,28 +185,8 @@ with DAG(
         config = load_config(CONFIG_PATH)
         with Database(config.database_path) as db:
             store.ensure_schema(db)
-            from reliability.checks import CheckResult  # local import: keep DAG parse light
-
-            results = [
-                CheckResult(
-                    check_id=row["check_id"],
-                    title=row["check_id"],
-                    entity=row["entity"],
-                    severity=row["severity"],
-                    owner=config.owner,
-                    status=row["status"],
-                    metric_value=row["metric_value"],
-                    unit=row["unit"] or "count",
-                    bounds={},
-                    message=row["message"] or "",
-                    rows_examined=row["rows_examined"],
-                    duration_ms=row["duration_ms"] or 0,
-                )
-                for row in store.results_for_run(db, summary["run_id"])
-            ]
-            open_counts: dict[str, int] = {}
-            for incident in incidents.open_incidents(db):
-                open_counts[incident["severity"]] = open_counts.get(incident["severity"], 0) + 1
+            results = _results_from_store(db, summary["run_id"], config.owner)
+            open_counts = _open_incident_counts(db)
 
         content = metrics.render(results, open_incidents=open_counts)
         path = metrics.write(config.metrics_path, content)
@@ -169,35 +197,7 @@ with DAG(
         config = load_config(CONFIG_PATH)
         with Database(config.database_path) as db:
             store.ensure_schema(db)
-            from reliability.checks import CheckResult
-
-            results = [
-                CheckResult(
-                    check_id=row["check_id"],
-                    title=row["check_id"],
-                    entity=row["entity"],
-                    severity=row["severity"],
-                    owner=config.owner,
-                    status=row["status"],
-                    metric_value=row["metric_value"],
-                    unit=row["unit"] or "count",
-                    bounds={},
-                    message=row["message"] or "",
-                    rows_examined=row["rows_examined"],
-                    duration_ms=row["duration_ms"] or 0,
-                )
-                for row in store.results_for_run(db, summary["run_id"])
-            ]
-            context = report.ReportContext(
-                env=config.env,
-                run_id=summary["run_id"],
-                run_ts=datetime.now(),
-                results=results,
-                incidents=incidents.open_incidents(db),
-                mttr=incidents.mttr(db),
-                sla_breaches=incidents.sla_breaches(db),
-                history=store.runs_history(db),
-            )
+            context = _report_context(db, config, summary["run_id"])
         path = report.write(config.report_path, report.render(context))
         return str(path)
 

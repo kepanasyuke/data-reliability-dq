@@ -14,7 +14,7 @@ import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import incidents, metrics, report, store
 from .checks import CheckResult, CheckRunner, exit_code, load_checks
@@ -59,6 +59,56 @@ def _write_notifications(config: Config, payload: dict[str, Any]) -> Path:
     return target
 
 
+def _report_context(
+    config: Config, db: Database, run_id: str, run_ts: datetime, results: Sequence[CheckResult],
+    events: Sequence[dict[str, Any]],
+) -> report.ReportContext:
+    return report.ReportContext(
+        env=config.env,
+        run_id=run_id,
+        run_ts=run_ts,
+        results=results,
+        incidents=incidents.open_incidents(db),
+        events=events,
+        mttr=incidents.mttr(db),
+        sla_breaches=incidents.sla_breaches(db),
+        history=store.runs_history(db),
+    )
+
+
+def _write_artifacts(
+    config: Config,
+    db: Database,
+    run_id: str,
+    run_ts: datetime,
+    results: Sequence[CheckResult],
+    events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    context = _report_context(config, db, run_id, run_ts, results, events)
+    report_path = report.write(config.report_path, report.render(context))
+    metrics_path = metrics.write(
+        config.metrics_path,
+        metrics.render(results, run_ts, _open_counts(db)),
+    )
+    payload = incidents.notification_payload(events, run_id, config.notify)
+    notifications_path = _write_notifications(config, payload)
+    return {
+        "report_path": report_path,
+        "metrics_path": metrics_path,
+        "notifications_path": notifications_path,
+        "payload": payload,
+    }
+
+
+def _announce(run_id: str, artifacts: Mapping[str, Any], results: Sequence[CheckResult]) -> None:
+    _print_results(results)
+    summary = artifacts["payload"]["summary"]
+    print(f"\nrun_id={run_id}  инцидентов открыто: {summary['opened']}, автозакрыто: {summary['resolved']}")
+    print(f"отчёт: {artifacts['report_path']}")
+    print(f"метрики: {artifacts['metrics_path']}")
+    print(f"уведомления: {artifacts['notifications_path']}")
+
+
 def execute_run(config: Config, db: Database, verbose: bool = True) -> dict[str, Any]:
     """Run every check, persist results, sync incidents, build artifacts."""
     specs = load_checks(config.checks_path)
@@ -70,43 +120,18 @@ def execute_run(config: Config, db: Database, verbose: bool = True) -> dict[str,
 
     store.save_results(db, run_id, run_ts.isoformat(timespec="seconds"), results)
     events = incidents.sync_incidents(db, run_id, results, config.owner)
-
-    open_incidents = incidents.open_incidents(db)
-    context = report.ReportContext(
-        env=config.env,
-        run_id=run_id,
-        run_ts=run_ts,
-        results=results,
-        incidents=open_incidents,
-        events=events,
-        mttr=incidents.mttr(db),
-        sla_breaches=incidents.sla_breaches(db),
-        history=store.runs_history(db),
-    )
-    report_path = report.write(config.report_path, report.render(context))
-    metrics_path = metrics.write(
-        config.metrics_path,
-        metrics.render(results, run_ts, _open_counts(db)),
-    )
-    payload = incidents.notification_payload(events, run_id, config.notify)
-    notifications_path = _write_notifications(config, payload)
+    artifacts = _write_artifacts(config, db, run_id, run_ts, results, events)
 
     if verbose:
-        _print_results(results)
-        opened = payload["summary"]["opened"]
-        resolved = payload["summary"]["resolved"]
-        print(f"\nrun_id={run_id}  инцидентов открыто: {opened}, автозакрыто: {resolved}")
-        print(f"отчёт: {report_path}")
-        print(f"метрики: {metrics_path}")
-        print(f"уведомления: {notifications_path}")
+        _announce(run_id, artifacts, results)
 
     return {
         "run_id": run_id,
         "results": results,
         "events": events,
-        "report_path": report_path,
-        "metrics_path": metrics_path,
-        "payload": payload,
+        "report_path": artifacts["report_path"],
+        "metrics_path": artifacts["metrics_path"],
+        "payload": artifacts["payload"],
     }
 
 
@@ -160,14 +185,7 @@ def cmd_run(config: Config, args: argparse.Namespace) -> int:
     return exit_code(outcome["results"], config.fail_on)
 
 
-def cmd_status(config: Config, args: argparse.Namespace) -> int:
-    with Database(config.database_path) as db:
-        store.ensure_schema(db)
-        open_list = incidents.open_incidents(db)
-        stats = incidents.mttr(db)
-        breaches = incidents.sla_breaches(db)
-        history = store.runs_history(db, limit=5)
-
+def _print_incident_table(open_list: Sequence[Mapping[str, Any]]) -> None:
     if not open_list:
         print("открытых инцидентов нет")
     else:
@@ -181,6 +199,8 @@ def cmd_status(config: Config, args: argparse.Namespace) -> int:
                 f"{incident['opened_at']} | {incident['occurrences']} |"
             )
 
+
+def _print_mttr(stats: Mapping[str, Any]) -> None:
     overall = stats["overall"]
     if overall["resolved"]:
         print(
@@ -190,6 +210,8 @@ def cmd_status(config: Config, args: argparse.Namespace) -> int:
     for severity, item in stats["by_severity"].items():
         print(f"  {severity}: {item['avg_minutes']} мин (закрыто {item['resolved']})")
 
+
+def _print_breaches(breaches: Sequence[Mapping[str, Any]]) -> None:
     if breaches:
         print("\nнарушение SLA реакции:")
         for breach in breaches:
@@ -198,6 +220,8 @@ def cmd_status(config: Config, args: argparse.Namespace) -> int:
                 f"{breach['age_minutes']} мин > {breach['budget_minutes']} мин"
             )
 
+
+def _print_history(history: Sequence[Mapping[str, Any]]) -> None:
     if history:
         print("\nпоследние прогоны:")
         for run in history:
@@ -205,6 +229,20 @@ def cmd_status(config: Config, args: argparse.Namespace) -> int:
                 f"  {run['run_ts']}  {run['run_id']}  checks={run['checks']} "
                 f"fail={run['failed']} warn={run['warned']} error={run['errored']}"
             )
+
+
+def cmd_status(config: Config, args: argparse.Namespace) -> int:
+    with Database(config.database_path) as db:
+        store.ensure_schema(db)
+        open_list = incidents.open_incidents(db)
+        stats = incidents.mttr(db)
+        breaches = incidents.sla_breaches(db)
+        history = store.runs_history(db, limit=5)
+
+    _print_incident_table(open_list)
+    _print_mttr(stats)
+    _print_breaches(breaches)
+    _print_history(history)
     return 0
 
 
@@ -224,18 +262,15 @@ def cmd_resolve(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_demo(config: Config, args: argparse.Namespace) -> int:
-    """End-to-end story: injected failures -> incident -> clean reload -> MTTR."""
+def _step(title: str, blank: bool = True) -> None:
+    print(("\n" if blank else "") + "=" * 78)
+    print(title)
     print("=" * 78)
-    print("ШАГ 1. Собираем демо-хранилище с внесёнными дефектами")
-    print("=" * 78)
-    stats = _seed(config, defects=True)
-    for item in stats["injected_defects"]:
-        print(f"  - {item}")
 
-    print("\n" + "=" * 78)
-    print("ШАГ 2. Прогон каталога проверок: часть проверок падает, открываются инциденты")
-    print("=" * 78)
+
+def _demo_broken_run(config: Config) -> tuple[dict[str, Any], Path, int]:
+    """Step 2: run the catalogue over defective data, keep the artifact and exit code."""
+    _step("ШАГ 2. Прогон каталога проверок: часть проверок падает, открываются инциденты")
     with Database(config.database_path) as db:
         store.ensure_schema(db)
         broken = execute_run(config, db)
@@ -243,11 +278,12 @@ def cmd_demo(config: Config, args: argparse.Namespace) -> int:
     incident_report = config.root / "artifacts" / "dq_report_incident.md"
     incident_report.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(broken["report_path"], incident_report)
-    code = exit_code(broken["results"], config.fail_on)
+    return broken, incident_report, exit_code(broken["results"], config.fail_on)
 
-    print("\n" + "=" * 78)
-    print("ШАГ 3. Перезаливаем данные без дефектов и повторяем прогон")
-    print("=" * 78)
+
+def _demo_healthy_run(config: Config) -> tuple[Path, list[dict[str, Any]], dict[str, Any]]:
+    """Step 3: reload clean data, run again, return the remaining incident state."""
+    _step("ШАГ 3. Перезаливаем данные без дефектов и повторяем прогон")
     _seed(config, defects=False)
     with Database(config.database_path) as db:
         store.ensure_schema(db)
@@ -257,10 +293,16 @@ def cmd_demo(config: Config, args: argparse.Namespace) -> int:
 
     resolved_report = config.root / "artifacts" / "dq_report_resolved.md"
     shutil.copyfile(healthy["report_path"], resolved_report)
+    return resolved_report, remaining, stats_after
 
-    print("\n" + "=" * 78)
-    print("ИТОГ")
-    print("=" * 78)
+
+def _print_demo_summary(
+    code: int,
+    remaining: Sequence[Mapping[str, Any]],
+    stats_after: Mapping[str, Any],
+    incident_report: Path,
+    resolved_report: Path,
+) -> None:
     print(f"  прогон с дефектами: {code} проверок с FAIL/ERROR, exit code {code}")
     print(f"  открытых инцидентов после восстановления: {len(remaining)}")
     overall = stats_after["overall"]
@@ -272,6 +314,20 @@ def cmd_demo(config: Config, args: argparse.Namespace) -> int:
         print(f"    {severity}: {item['avg_minutes']} мин ({item['resolved']} шт.)")
     print(f"  отчёт инцидента: {incident_report}")
     print(f"  отчёт после восстановления: {resolved_report}")
+
+
+def cmd_demo(config: Config, args: argparse.Namespace) -> int:
+    """End-to-end story: injected failures -> incident -> clean reload -> MTTR."""
+    _step("ШАГ 1. Собираем демо-хранилище с внесёнными дефектами", blank=False)
+    stats = _seed(config, defects=True)
+    for item in stats["injected_defects"]:
+        print(f"  - {item}")
+
+    broken, incident_report, code = _demo_broken_run(config)
+    resolved_report, remaining, stats_after = _demo_healthy_run(config)
+
+    _step("ИТОГ")
+    _print_demo_summary(code, remaining, stats_after, incident_report, resolved_report)
     return 0
 
 
@@ -292,6 +348,39 @@ def cmd_report(config: Config, args: argparse.Namespace) -> int:
     return code
 
 
+def _add_simple_parser(
+    sub: argparse._SubParsersAction, name: str, help_text: str, func: Any
+) -> argparse.ArgumentParser:
+    parser = sub.add_parser(name, help=help_text)
+    parser.set_defaults(func=func)
+    return parser
+
+
+def _add_seed_parser(sub: argparse._SubParsersAction) -> None:
+    seed = sub.add_parser("seed", help="пересобрать демо-хранилище")
+    seed.add_argument("--clean", action="store_true", help="без внесения дефектов")
+    seed.set_defaults(func=cmd_seed)
+
+
+def _add_run_parser(sub: argparse._SubParsersAction) -> None:
+    run = sub.add_parser("run", help="выполнить каталог проверок")
+    run.add_argument(
+        "--fail-on",
+        choices=["P1", "P2", "P3", "none"],
+        help="минимальная severity для ненулевого exit code",
+    )
+    run.set_defaults(func=cmd_run)
+
+
+def _add_incident_parser(
+    sub: argparse._SubParsersAction, name: str, help_text: str, func: Any
+) -> None:
+    parser = sub.add_parser(name, help=help_text)
+    parser.add_argument("incident_id")
+    parser.add_argument("--note", default="")
+    parser.set_defaults(func=func)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reliability",
@@ -300,31 +389,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config/demo.json", help="путь к JSON-конфигу")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="создать ops-таблицы").set_defaults(func=cmd_init)
-
-    seed = sub.add_parser("seed", help="пересобрать демо-хранилище")
-    seed.add_argument("--clean", action="store_true", help="без внесения дефектов")
-    seed.set_defaults(func=cmd_seed)
-
-    run = sub.add_parser("run", help="выполнить каталог проверок")
-    run.add_argument("--fail-on", choices=["P1", "P2", "P3", "none"], help="минимальная severity для ненулевого exit code")
-    run.set_defaults(func=cmd_run)
-
-    sub.add_parser("status", help="открытые инциденты, MTTR, SLA").set_defaults(func=cmd_status)
-
-    ack = sub.add_parser("ack", help="взять инцидент в работу")
-    ack.add_argument("incident_id")
-    ack.add_argument("--note", default="")
-    ack.set_defaults(func=cmd_ack)
-
-    resolve = sub.add_parser("resolve", help="закрыть инцидент вручную")
-    resolve.add_argument("incident_id")
-    resolve.add_argument("--note", default="")
-    resolve.set_defaults(func=cmd_resolve)
-
-    sub.add_parser("report", help="показать последний прогон").set_defaults(func=cmd_report)
-
-    sub.add_parser("demo", help="полный сценарий: дефекты -> инцидент -> восстановление").set_defaults(func=cmd_demo)
+    _add_simple_parser(sub, "init", "создать ops-таблицы", cmd_init)
+    _add_seed_parser(sub)
+    _add_run_parser(sub)
+    _add_simple_parser(sub, "status", "открытые инциденты, MTTR, SLA", cmd_status)
+    _add_incident_parser(sub, "ack", "взять инцидент в работу", cmd_ack)
+    _add_incident_parser(sub, "resolve", "закрыть инцидент вручную", cmd_resolve)
+    _add_simple_parser(sub, "report", "показать последний прогон", cmd_report)
+    _add_simple_parser(
+        sub, "demo", "полный сценарий: дефекты -> инцидент -> восстановление", cmd_demo
+    )
     return parser
 
 

@@ -86,16 +86,20 @@ class CheckResult:
         }
 
 
-def _violates(bound: Mapping[str, float], value: float) -> bool:
-    def exceeded(operator: str, threshold: float) -> bool:
-        comparisons = {
-            "max": value > threshold,
-            "min": value < threshold,
-            "eq": value != threshold,
-        }
-        return comparisons.get(operator, False)
+_OPERATORS: dict[str, Callable[[float, float], bool]] = {
+    "max": lambda value, threshold: value > threshold,
+    "min": lambda value, threshold: value < threshold,
+    "eq": lambda value, threshold: value != threshold,
+}
 
-    return any(exceeded(operator, float(threshold)) for operator, threshold in bound.items())
+
+def _violates(bound: Mapping[str, float], value: float) -> bool:
+    """True when any operator of the bound is breached by ``value``."""
+    return any(
+        _OPERATORS[operator](value, float(threshold))
+        for operator, threshold in bound.items()
+        if operator in _OPERATORS
+    )
 
 
 def evaluate(spec: CheckSpec, value: float) -> str:
@@ -118,46 +122,69 @@ def _describe_bound(bound: Mapping[str, float]) -> str:
     return " and ".join(parts) or "n/a"
 
 
+def _require_check_id(raw: Mapping[str, Any]) -> str:
+    check_id = raw.get("check_id")
+    if not check_id:
+        raise CheckConfigError(f"check without check_id: {raw!r}")
+    return check_id
+
+
+def _require_bounds(check_id: str, raw: Mapping[str, Any]) -> Mapping[str, Mapping[str, float]]:
+    bounds = raw.get("bounds") or {}
+    if "fail" not in bounds:
+        raise CheckConfigError(f"{check_id}: 'bounds.fail' is required")
+    return bounds
+
+
+def _require_source(check_id: str, raw: Mapping[str, Any]) -> None:
+    validator = raw.get("validator")
+    if not raw.get("sql") and not validator:
+        raise CheckConfigError(f"{check_id}: either 'sql' or 'validator' is required")
+    if validator and validator not in VALIDATORS:
+        raise CheckConfigError(f"{check_id}: unknown validator {validator!r}")
+
+
+def _require_severity(check_id: str, raw: Mapping[str, Any]) -> str:
+    severity = raw.get("severity", "P2")
+    if severity not in SEVERITY_ORDER:
+        raise CheckConfigError(f"{check_id}: unknown severity {severity!r}")
+    return severity
+
+
+def _spec_from_raw(raw: Mapping[str, Any]) -> CheckSpec:
+    check_id = _require_check_id(raw)
+    _require_source(check_id, raw)
+    return CheckSpec(
+        check_id=check_id,
+        title=raw.get("title", check_id),
+        entity=raw.get("entity", "unknown"),
+        severity=_require_severity(check_id, raw),
+        owner=raw.get("owner", ""),
+        bounds=_require_bounds(check_id, raw),
+        sql=raw.get("sql"),
+        validator=raw.get("validator"),
+        sample_sql=raw.get("sample_sql"),
+        params=raw.get("params") or {},
+        unit=raw.get("unit", "count"),
+        description=raw.get("description", ""),
+        tags=tuple(raw.get("tags") or ()),
+    )
+
+
+def _require_unique(specs: Sequence[CheckSpec]) -> list[CheckSpec]:
+    seen: set[str] = set()
+    for spec in specs:
+        if spec.check_id in seen:
+            raise CheckConfigError(f"duplicate check_id: {spec.check_id}")
+        seen.add(spec.check_id)
+    return list(specs)
+
+
 def load_checks(path: str | Path) -> list[CheckSpec]:
+    """Parse the catalogue and return validated specs."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     entries = payload.get("checks", payload) if isinstance(payload, dict) else payload
-    specs: list[CheckSpec] = []
-    seen: set[str] = set()
-    for raw in entries:
-        check_id = raw.get("check_id")
-        if not check_id:
-            raise CheckConfigError(f"check without check_id: {raw!r}")
-        if check_id in seen:
-            raise CheckConfigError(f"duplicate check_id: {check_id}")
-        seen.add(check_id)
-        bounds = raw.get("bounds") or {}
-        if "fail" not in bounds:
-            raise CheckConfigError(f"{check_id}: 'bounds.fail' is required")
-        if not raw.get("sql") and not raw.get("validator"):
-            raise CheckConfigError(f"{check_id}: either 'sql' or 'validator' is required")
-        if raw.get("validator") and raw["validator"] not in VALIDATORS:
-            raise CheckConfigError(f"{check_id}: unknown validator {raw['validator']!r}")
-        severity = raw.get("severity", "P2")
-        if severity not in SEVERITY_ORDER:
-            raise CheckConfigError(f"{check_id}: unknown severity {severity!r}")
-        specs.append(
-            CheckSpec(
-                check_id=check_id,
-                title=raw.get("title", check_id),
-                entity=raw.get("entity", "unknown"),
-                severity=severity,
-                owner=raw.get("owner", ""),
-                bounds=bounds,
-                sql=raw.get("sql"),
-                validator=raw.get("validator"),
-                sample_sql=raw.get("sample_sql"),
-                params=raw.get("params") or {},
-                unit=raw.get("unit", "count"),
-                description=raw.get("description", ""),
-                tags=tuple(raw.get("tags") or ()),
-            )
-        )
-    return specs
+    return _require_unique([_spec_from_raw(raw) for raw in entries])
 
 
 class CheckRunner:
@@ -191,11 +218,8 @@ class CheckRunner:
                 samples = [{"sample_error": str(exc)}]
         return samples
 
-    def run_check(self, spec: CheckSpec) -> CheckResult:
-        params = {**self.runtime_params, **spec.params}
-        started = datetime.now(timezone.utc)
-        clock = time.perf_counter()
-        common = {
+    def _common(self, spec: CheckSpec, started: datetime) -> dict[str, Any]:
+        return {
             "check_id": spec.check_id,
             "title": spec.title,
             "entity": spec.entity,
@@ -205,39 +229,64 @@ class CheckRunner:
             "bounds": spec.bounds,
             "started_at": started.isoformat(timespec="seconds"),
         }
+
+    def _outcome(self, spec: CheckSpec, row: Mapping[str, Any]) -> tuple[str, float | None, str, Any]:
+        raw_value = row.get("metric_value")
+        message = row.get("message") or ""
+        if raw_value is None:
+            status: str = FAIL
+            value: float | None = None
+            message = message or "metric is null - source table looks empty or stale"
+        else:
+            value = float(raw_value)
+            status = evaluate(spec, value)
+            message = message or (
+                f"{spec.unit}: {value:g} (threshold {_describe_bound(spec.bounds['fail'])})"
+            )
+        return status, value, message, row.get("rows_examined")
+
+    def _execution_error(
+        self, spec: CheckSpec, started: datetime, duration_ms: int, exc: Exception
+    ) -> CheckResult:
+        return CheckResult(
+            status=ERROR,
+            metric_value=None,
+            message=f"check failed to execute: {exc}",
+            duration_ms=duration_ms,
+            **self._common(spec, started),
+        )
+
+    def _result_from_row(
+        self,
+        spec: CheckSpec,
+        params: Mapping[str, Any],
+        started: datetime,
+        duration_ms: int,
+        row: Mapping[str, Any],
+    ) -> CheckResult:
+        status, value, message, rows_examined = self._outcome(spec, row)
+        return CheckResult(
+            status=status,
+            metric_value=value,
+            message=message,
+            rows_examined=int(rows_examined) if rows_examined is not None else None,
+            duration_ms=duration_ms,
+            samples=self._samples(spec, params) if status != PASS else [],
+            **self._common(spec, started),
+        )
+
+    def run_check(self, spec: CheckSpec) -> CheckResult:
+        params = {**self.runtime_params, **spec.params}
+        started = datetime.now(timezone.utc)
+        clock = time.perf_counter()
         try:
             row = self._execute(spec, params)
         except Exception as exc:
-            result = CheckResult(
-                status=ERROR,
-                metric_value=None,
-                message=f"check failed to execute: {exc}",
-                duration_ms=int((time.perf_counter() - clock) * 1000),
-                **common,
-            )
+            duration_ms = int((time.perf_counter() - clock) * 1000)
+            result = self._execution_error(spec, started, duration_ms, exc)
         else:
-            raw_value = row.get("metric_value")
-            message = row.get("message") or ""
-            rows_examined = row.get("rows_examined")
-            if raw_value is None:
-                status = FAIL
-                value: float | None = None
-                message = message or "metric is null - source table looks empty or stale"
-            else:
-                value = float(raw_value)
-                status = evaluate(spec, value)
-                message = message or (
-                    f"{spec.unit}: {value:g} (threshold {_describe_bound(spec.bounds['fail'])})"
-                )
-            result = CheckResult(
-                status=status,
-                metric_value=value,
-                message=message,
-                rows_examined=int(rows_examined) if rows_examined is not None else None,
-                duration_ms=int((time.perf_counter() - clock) * 1000),
-                samples=self._samples(spec, params) if status != PASS else [],
-                **common,
-            )
+            duration_ms = int((time.perf_counter() - clock) * 1000)
+            result = self._result_from_row(spec, params, started, duration_ms, row)
         return result
 
     def run(self) -> list[CheckResult]:

@@ -65,30 +65,31 @@ def ensure_schema(db: Database) -> None:
             db.execute(chunk)
 
 
+def _result_row(run_id: str, run_ts: str, result: CheckResult) -> tuple:
+    return (
+        run_id,
+        run_ts,
+        result.check_id,
+        result.entity,
+        result.severity,
+        result.status,
+        result.metric_value,
+        result.unit,
+        result.message,
+        result.rows_examined,
+        result.duration_ms,
+        json.dumps(list(result.samples), ensure_ascii=False, default=str),
+    )
+
+
 def save_results(
     db: Database, run_id: str, run_ts: str, results: Iterable[CheckResult]
 ) -> int:
-    payload = [
-        (
-            run_id,
-            run_ts,
-            result.check_id,
-            result.entity,
-            result.severity,
-            result.status,
-            result.metric_value,
-            result.unit,
-            result.message,
-            result.rows_examined,
-            result.duration_ms,
-            json.dumps(list(result.samples), ensure_ascii=False, default=str),
-        )
-        for result in results
-    ]
+    payload = [_result_row(run_id, run_ts, result) for result in results]
     written = 0
     if payload:
         written = db.executemany(
-        """
+            """
         INSERT INTO ops_dq_result
             (run_id, run_ts, check_id, entity, severity, status, metric_value,
              unit, message, rows_examined, duration_ms, samples_json)

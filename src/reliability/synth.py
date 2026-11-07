@@ -67,6 +67,197 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _insert_products(db: Database) -> None:
+    db.executemany(
+        "INSERT INTO dim_product (product_code, product_name, product_family, is_credit)"
+        " VALUES (?, ?, ?, ?)",
+        PRODUCTS,
+    )
+
+
+def _build_clients(rng: random.Random, today: date, n_clients: int) -> list[tuple]:
+    clients: list[tuple] = []
+    for index in range(n_clients):
+        is_legal = rng.random() > 0.15
+        clients.append(
+            (
+                f"CL{index:06d}",
+                make_inn(rng, is_legal),
+                make_ogrn(rng, is_legal),
+                f"ООО «{rng.choice(NAME_PARTS)}{rng.choice(NAME_PARTS)}»"
+                if is_legal
+                else f"ИП {rng.choice(NAME_PARTS)}-{index}",
+                rng.choice(SEGMENTS),
+                f"MGR{rng.randint(1, 24):03d}",
+                (today - timedelta(days=rng.randint(120, 3600))).isoformat(),
+                None,
+            )
+        )
+    return clients
+
+
+def _insert_clients(db: Database, clients: list[tuple]) -> None:
+    db.executemany(
+        "INSERT INTO dim_client (client_id, inn, ogrn, client_name, segment,"
+        " manager_id, opened_dt, closed_dt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        clients,
+    )
+
+
+def _build_accounts(rng: random.Random, clients: list[tuple]) -> list[tuple[str, str, str, float]]:
+    accounts: list[tuple[str, str, str, float]] = []
+    for client in clients:
+        for _ in range(rng.randint(2, 4)):
+            accounts.append(
+                (
+                    f"AC{len(accounts):08d}",
+                    client[0],
+                    rng.choice(CURRENCIES),
+                    rng.uniform(50_000, 20_000_000),
+                )
+            )
+    return accounts
+
+
+def _balance_step(rng: random.Random, base: float, balance_kop: int) -> tuple[int, int, int]:
+    """One day of the running balance: (new_balance, debit, credit) in kopecks."""
+    delta_kop = int(round(rng.gauss(0, max(base * 0.03, 1.0)) * 100))
+    new_balance_kop = max(0, balance_kop + delta_kop)
+    actual_delta_kop = new_balance_kop - balance_kop
+    credit_kop = int(round(rng.uniform(0, max(base * 0.05, 1.0)) * 100))
+    debit_kop = credit_kop - actual_delta_kop
+    if debit_kop < 0:
+        debit_kop = 0
+        credit_kop = max(actual_delta_kop, 0)
+    return new_balance_kop, debit_kop, credit_kop
+
+
+def _turnover_for_account(
+    rng: random.Random,
+    account: tuple[str, str, str, float],
+    dates: list[date],
+    load_dt: str,
+) -> list[tuple]:
+    """Running balance: every day continues from the previous closing balance."""
+    account_id, client_id, currency, base = account
+    balance_kop = int(round(base * 100))
+    rows: list[tuple] = []
+    for day in dates:
+        new_balance_kop, debit_kop, credit_kop = _balance_step(rng, base, balance_kop)
+        rows.append(
+            (account_id, day.isoformat(), currency, client_id, debit_kop / 100,
+             credit_kop / 100, new_balance_kop / 100, rng.choice(SRC_SYSTEMS), load_dt)
+        )
+        balance_kop = new_balance_kop
+    return rows
+
+
+def _build_turnover(
+    rng: random.Random,
+    accounts: list[tuple[str, str, str, float]],
+    dates: list[date],
+    load_dt: str,
+) -> list[tuple]:
+    return [
+        row
+        for account in accounts
+        for row in _turnover_for_account(rng, account, dates, load_dt)
+    ]
+
+
+def _insert_turnover(db: Database, turnover: list[tuple]) -> None:
+    db.executemany(
+        "INSERT INTO fct_account_turnover_daily (account_id, dt, currency, client_id,"
+        " debit_turnover, credit_turnover, balance_eod, src_system, load_dt)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        turnover,
+    )
+
+
+def _loans_for_client(
+    rng: random.Random, client: tuple, today: date, loan_codes: list[str], load_dt: str
+) -> list[tuple]:
+    rows: list[tuple] = []
+    if rng.random() <= 0.45:
+        for code in rng.sample(loan_codes, k=rng.randint(1, len(loan_codes))):
+            limit_amt = round(rng.uniform(1_000_000, 250_000_000), 2)
+            debt = round(limit_amt * rng.uniform(0.05, 0.92), 2)
+            for months_ago in range(11, -1, -1):
+                month = (today.replace(day=1) - timedelta(days=months_ago * 30)).strftime("%Y-%m")
+                rows.append(
+                    (
+                        client[0],
+                        code,
+                        month,
+                        limit_amt,
+                        round(debt * rng.uniform(0.9, 1.02), 2),
+                        round(debt * rng.choice([0.0, 0.0, 0.0, 0.004, 0.02]), 2),
+                        round(rng.uniform(9.5, 24.5), 2),
+                        load_dt,
+                    )
+                )
+    return rows
+
+
+def _build_loans(rng: random.Random, clients: list[tuple], today: date, load_dt: str) -> list[tuple]:
+    loan_codes = [code for code, _, _, is_credit in PRODUCTS if is_credit]
+    return [
+        row
+        for client in clients
+        for row in _loans_for_client(rng, client, today, loan_codes, load_dt)
+    ]
+
+
+def _insert_loans(db: Database, loans: list[tuple]) -> None:
+    db.executemany(
+        "INSERT INTO fct_loan_portfolio_monthly (client_id, product_code, month,"
+        " limit_amt, debt_amt, overdue_amt, interest_rate, load_dt)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        loans,
+    )
+
+
+def _dates_back(today: date, days: int) -> list[date]:
+    return [today - timedelta(days=offset) for offset in range(days, 0, -1)]
+
+
+def _stats(
+    clients: list[tuple],
+    accounts: list[tuple],
+    turnover: list[tuple],
+    loans: list[tuple],
+    days: int,
+    injected_defects: list[str],
+) -> dict[str, Any]:
+    return {
+        "clients": len(clients),
+        "accounts": len(accounts),
+        "turnover_rows": len(turnover),
+        "loan_rows": len(loans),
+        "days": days,
+        "injected_defects": injected_defects,
+    }
+
+
+def _load_marts(
+    db: Database,
+    rng: random.Random,
+    now: datetime,
+    clients: list[tuple],
+    accounts: list[tuple[str, str, str, float]],
+    today: date,
+    days: int,
+) -> tuple[list[tuple], list[tuple]]:
+    """Turnover and loan portfolio: the two marts the catalogue watches."""
+    turnover = _build_turnover(
+        rng, accounts, _dates_back(today, days), _iso(now - timedelta(hours=2))
+    )
+    _insert_turnover(db, turnover)
+    loans = _build_loans(rng, clients, today, _iso(now - timedelta(hours=5)))
+    _insert_loans(db, loans)
+    return turnover, loans
+
+
 def build_demo(
     db: Database,
     root: Path,
@@ -80,124 +271,37 @@ def build_demo(
     today = now.date()
     db.script(root / SCHEMA_PATH)
 
-    # -- dimensions --------------------------------------------------------
-    db.executemany(
-        "INSERT INTO dim_product (product_code, product_name, product_family, is_credit)"
-        " VALUES (?, ?, ?, ?)",
-        PRODUCTS,
-    )
+    _insert_products(db)
+    clients = _build_clients(rng, today, n_clients)
+    _insert_clients(db, clients)
 
-    clients: list[tuple] = []
-    for index in range(n_clients):
-        client_id = f"CL{index:06d}"
-        is_legal = rng.random() > 0.15
-        clients.append(
-            (
-                client_id,
-                make_inn(rng, is_legal),
-                make_ogrn(rng, is_legal),
-                f"ООО «{rng.choice(NAME_PARTS)}{rng.choice(NAME_PARTS)}»"
-                if is_legal
-                else f"ИП {rng.choice(NAME_PARTS)}-{index}",
-                rng.choice(SEGMENTS),
-                f"MGR{rng.randint(1, 24):03d}",
-                (today - timedelta(days=rng.randint(120, 3600))).isoformat(),
-                None,
-            )
-        )
-    db.executemany(
-        "INSERT INTO dim_client (client_id, inn, ogrn, client_name, segment,"
-        " manager_id, opened_dt, closed_dt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        clients,
-    )
-
-    # -- accounts ----------------------------------------------------------
-    accounts: list[tuple[str, str, str, float]] = []
-    for client in clients:
-        for _ in range(rng.randint(2, 4)):
-            account = f"AC{len(accounts):08d}"
-            accounts.append((account, client[0], rng.choice(CURRENCIES), rng.uniform(50_000, 20_000_000)))
-
-    # -- daily turnover with a continuous balance (running balance) --------
-    load_dt = _iso(now - timedelta(hours=2))
-    dates = [today - timedelta(days=offset) for offset in range(days, 0, -1)]
-    turnover: list[tuple] = []
-    for account_id, client_id, currency, base in accounts:
-        balance_kop = int(round(base * 100))
-        for day in dates:
-            delta_kop = int(round(rng.gauss(0, max(base * 0.03, 1.0)) * 100))
-            new_balance_kop = max(0, balance_kop + delta_kop)
-            actual_delta_kop = new_balance_kop - balance_kop
-            credit_kop = int(round(rng.uniform(0, max(base * 0.05, 1.0)) * 100))
-            debit_kop = credit_kop - actual_delta_kop
-            if debit_kop < 0:
-                debit_kop = 0
-                credit_kop = max(actual_delta_kop, 0)
-            turnover.append(
-                (
-                    account_id,
-                    day.isoformat(),
-                    currency,
-                    client_id,
-                    debit_kop / 100,
-                    credit_kop / 100,
-                    new_balance_kop / 100,
-                    rng.choice(SRC_SYSTEMS),
-                    load_dt,
-                )
-            )
-            balance_kop = new_balance_kop
-    db.executemany(
-        "INSERT INTO fct_account_turnover_daily (account_id, dt, currency, client_id,"
-        " debit_turnover, credit_turnover, balance_eod, src_system, load_dt)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        turnover,
-    )
-
-    # -- monthly loan portfolio (12 months) --------------------------------
-    loans: list[tuple] = []
-    loan_codes = [code for code, _, _, is_credit in PRODUCTS if is_credit]
-    loan_load_dt = _iso(now - timedelta(hours=5))
-    for client in clients:
-        if rng.random() > 0.45:
-            continue
-        for code in rng.sample(loan_codes, k=rng.randint(1, len(loan_codes))):
-            limit_amt = round(rng.uniform(1_000_000, 250_000_000), 2)
-            debt = round(limit_amt * rng.uniform(0.05, 0.92), 2)
-            for months_ago in range(11, -1, -1):
-                month = (today.replace(day=1) - timedelta(days=months_ago * 30)).strftime("%Y-%m")
-                loans.append(
-                    (
-                        client[0],
-                        code,
-                        month,
-                        limit_amt,
-                        round(debt * rng.uniform(0.9, 1.02), 2),
-                        round(debt * rng.choice([0.0, 0.0, 0.0, 0.004, 0.02]), 2),
-                        round(rng.uniform(9.5, 24.5), 2),
-                        loan_load_dt,
-                    )
-                )
-    db.executemany(
-        "INSERT INTO fct_loan_portfolio_monthly (client_id, product_code, month,"
-        " limit_amt, debt_amt, overdue_amt, interest_rate, load_dt)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        loans,
-    )
-
+    accounts = _build_accounts(rng, clients)
+    turnover, loans = _load_marts(db, rng, now, clients, accounts, today, days)
     _refresh_batch_metadata(db, now)
 
-    stats: dict[str, Any] = {
-        "clients": len(clients),
-        "accounts": len(accounts),
-        "turnover_rows": len(turnover),
-        "loan_rows": len(loans),
-        "days": days,
-        "injected_defects": [],
-    }
-    if inject_defects:
-        stats["injected_defects"] = _inject_defects(db, rng, today, accounts)
-    return stats
+    defects = _inject_defects(db, rng, today, accounts) if inject_defects else []
+    return _stats(clients, accounts, turnover, loans, days, defects)
+
+
+def _batch_rows(now: datetime, turnover_rows: int, loan_rows: int) -> list[tuple]:
+    return [
+        (
+            "BT-0001",
+            "mart_turnover_daily",
+            "fct_account_turnover_daily",
+            _iso(now - timedelta(hours=2)),
+            turnover_rows,
+            "SUCCESS",
+        ),
+        (
+            "BT-0002",
+            "mart_loan_portfolio_monthly",
+            "fct_loan_portfolio_monthly",
+            _iso(now - timedelta(hours=5)),
+            loan_rows,
+            "SUCCESS",
+        ),
+    ]
 
 
 def _refresh_batch_metadata(db: Database, now: datetime) -> None:
@@ -207,33 +311,12 @@ def _refresh_batch_metadata(db: Database, now: datetime) -> None:
     db.executemany(
         "INSERT INTO etl_batch (batch_id, dag_id, entity, load_dt, rows_loaded, status)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        [
-            (
-                "BT-0001",
-                "mart_turnover_daily",
-                "fct_account_turnover_daily",
-                _iso(now - timedelta(hours=2)),
-                turnover_rows,
-                "SUCCESS",
-            ),
-            (
-                "BT-0002",
-                "mart_loan_portfolio_monthly",
-                "fct_loan_portfolio_monthly",
-                _iso(now - timedelta(hours=5)),
-                loan_rows,
-                "SUCCESS",
-            ),
-        ],
+        _batch_rows(now, turnover_rows, loan_rows),
     )
 
 
-def _inject_defects(
-    db: Database, rng: random.Random, today: date, accounts: list[tuple[str, str, str, float]]
-) -> list[str]:
-    injected: list[str] = []
-
-    # 1. Broken INN checksum on 3 clients (data-quality, P1).
+def _break_inn_checksums(db: Database) -> str:
+    """Defect 1: broken INN checksum on 3 clients (data quality, P1)."""
     broken_inn = db.query("SELECT client_id, inn FROM dim_client ORDER BY client_id LIMIT 3")
     for row in broken_inn:
         inn = row["inn"]
@@ -242,9 +325,11 @@ def _inject_defects(
             "UPDATE dim_client SET inn = :inn WHERE client_id = :client_id",
             {"inn": wrong, "client_id": row["client_id"]},
         )
-    injected.append("3 clients with an invalid INN checksum")
+    return "3 clients with an invalid INN checksum"
 
-    # 2. Broken OGRN checksum on 2 clients (P2).
+
+def _break_ogrn_checksums(db: Database) -> str:
+    """Defect 2: broken OGRN checksum on 2 clients (P2)."""
     for row in db.query("SELECT client_id, ogrn FROM dim_client ORDER BY client_id DESC LIMIT 2"):
         ogrn = row["ogrn"]
         wrong = ogrn[:-1] + str((int(ogrn[-1]) + 1) % 10)
@@ -252,9 +337,11 @@ def _inject_defects(
             "UPDATE dim_client SET ogrn = :ogrn WHERE client_id = :client_id",
             {"ogrn": wrong, "client_id": row["client_id"]},
         )
-    injected.append("2 clients with an invalid OGRN control digit")
+    return "2 clients with an invalid OGRN control digit"
 
-    # 3. Segment completeness dropped to ~12% nulls (P2).
+
+def _blank_segments(db: Database) -> str:
+    """Defect 3: segment completeness dropped to ~12% nulls (P2)."""
     db.execute(
         """
         UPDATE dim_client
@@ -262,9 +349,11 @@ def _inject_defects(
         WHERE (CAST(SUBSTR(client_id, 3) AS INTEGER) % 8) = 0
         """
     )
-    injected.append("about 12% of clients lost the segment attribute")
+    return "about 12% of clients lost the segment attribute"
 
-    # 4. Duplicate grain: same account, same day twice (P2).
+
+def _duplicate_grain(db: Database, accounts: list[tuple], today: date) -> str:
+    """Defect 4: duplicate grain - same account, same day twice (P2)."""
     duplicate_accounts = [account[0] for account in accounts[:2]]
     last_days = [(today - timedelta(days=offset)).isoformat() for offset in (1, 2, 3)]
     for account_id in duplicate_accounts:
@@ -281,10 +370,12 @@ def _inject_defects(
                 """,
                 {"account_id": account_id, "dt": day},
             )
-    injected.append("duplicate (account_id, dt, currency) rows for 2 accounts x 3 days")
+    return "duplicate (account_id, dt, currency) rows for 2 accounts x 3 days"
 
-    # 5. Orphan client reference (P1).
-    for account_id, _, currency, _ in accounts[-6:]:
+
+def _orphan_clients(db: Database, accounts: list[tuple], today: date) -> str:
+    """Defect 5: orphan client reference (P1)."""
+    for account_id, _, _, _ in accounts[-6:]:
         db.execute(
             """
             INSERT INTO fct_account_turnover_daily
@@ -297,12 +388,14 @@ def _inject_defects(
             """,
             {"account_id": account_id, "dt": (today - timedelta(days=10)).isoformat()},
         )
-    injected.append(
+    return (
         "6 turnover rows referencing a non-existent client CL999999 "
         "(они же дают 6 дублей гранулярности)"
     )
 
-    # 6. Negative closing balance (P2) - also breaks balance continuity.
+
+def _negative_balances(db: Database, accounts: list[tuple], today: date) -> str:
+    """Defect 6: negative closing balance (P2) - also breaks balance continuity."""
     negative_day = (today - timedelta(days=3)).isoformat()
     for account_id, _, _, _ in accounts[10:14]:
         db.execute(
@@ -313,9 +406,11 @@ def _inject_defects(
             """,
             {"account_id": account_id, "dt": negative_day},
         )
-    injected.append("4 accounts with a negative closing balance")
+    return "4 accounts with a negative closing balance"
 
-    # 7. Silent balance drift: continuity broken without a negative value (P2).
+
+def _balance_drift(db: Database, accounts: list[tuple], today: date) -> str:
+    """Defect 7: silent drift - continuity broken without a negative value (P2)."""
     drift_day = (today - timedelta(days=12)).isoformat()
     for account_id, _, _, _ in accounts[20:25]:
         db.execute(
@@ -326,9 +421,11 @@ def _inject_defects(
             """,
             {"account_id": account_id, "dt": drift_day},
         )
-    injected.append("5 rows with a silent +1000 balance drift")
+    return "5 rows with a silent +1000 balance drift"
 
-    # 8. Partial load of the last day: only 40% of accounts arrived (P1).
+
+def _partial_load(db: Database, today: date) -> str:
+    """Defect 8: partial load of the last day - only 40% of accounts arrived (P1)."""
     yesterday = (today - timedelta(days=1)).isoformat()
     db.execute(
         """
@@ -338,16 +435,20 @@ def _inject_defects(
         """,
         {"dt": yesterday},
     )
-    injected.append("partial load: the last day has only ~40% of accounts")
+    return "partial load: the last day has only ~40% of accounts"
 
-    # 9. Stale loan portfolio: last load 30 hours ago, SLA is 24h (P2).
+
+def _stale_loans(db: Database) -> str:
+    """Defect 9: stale loan portfolio - last load 30 hours ago, SLA is 24h (P2)."""
     db.execute(
         "UPDATE fct_loan_portfolio_monthly SET load_dt = :load_dt",
         {"load_dt": _iso(_now() - timedelta(hours=30))},
     )
-    injected.append("loan portfolio load is 30 hours old (SLA 24h)")
+    return "loan portfolio load is 30 hours old (SLA 24h)"
 
-    # 10. Debt above the approved limit (P2).
+
+def _debt_over_limit(db: Database) -> str:
+    """Defect 10: debt above the approved limit (P2)."""
     for row in db.query(
         """
         SELECT client_id, product_code, month, limit_amt
@@ -369,9 +470,11 @@ def _inject_defects(
                 "month": row["month"],
             },
         )
-    injected.append("5 portfolio rows with debt_amt above limit_amt")
+    return "5 portfolio rows with debt_amt above limit_amt"
 
-    # 11. Batch metadata lies about the rowcount (P3, triggers reconciliation).
+
+def _lie_about_rowcount(db: Database) -> str:
+    """Defect 11: batch metadata lies about the rowcount (P3, triggers reconciliation)."""
     actual = int(db.scalar("SELECT COUNT(*) FROM fct_account_turnover_daily", default=0))
     db.execute(
         """
@@ -380,9 +483,26 @@ def _inject_defects(
         """,
         {"rows": actual + 1234},
     )
-    injected.append("etl_batch.rows_loaded differs from the mart rowcount by 1234")
+    return "etl_batch.rows_loaded differs from the mart rowcount by 1234"
 
-    return injected
+
+def _inject_defects(
+    db: Database, rng: random.Random, today: date, accounts: list[tuple[str, str, str, float]]
+) -> list[str]:
+    """Apply each defect in catalogue order; ``rng`` is kept for future randomisation."""
+    return [
+        _break_inn_checksums(db),
+        _break_ogrn_checksums(db),
+        _blank_segments(db),
+        _duplicate_grain(db, accounts, today),
+        _orphan_clients(db, accounts, today),
+        _negative_balances(db, accounts, today),
+        _balance_drift(db, accounts, today),
+        _partial_load(db, today),
+        _stale_loans(db),
+        _debt_over_limit(db),
+        _lie_about_rowcount(db),
+    ]
 
 
 def describe_defects(db: Database) -> dict[str, Any]:  # pragma: no cover - diagnostics

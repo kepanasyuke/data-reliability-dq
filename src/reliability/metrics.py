@@ -39,45 +39,59 @@ def _labels(**labels: object) -> str:
     return "{" + inner + "}" if inner else ""
 
 
+def _header_lines() -> list[str]:
+    lines: list[str] = []
+    for name, (metric_type, description) in HELP.items():
+        lines.append(f"# HELP {name} {description}")
+        lines.append(f"# TYPE {name} {metric_type}")
+    return lines
+
+
+def _emit(name: str, labels: Mapping[str, object], value: float) -> str:
+    return f"{name}{_labels(**labels)} {value}"
+
+
+def _result_lines(result: CheckResult) -> list[str]:
+    labels = {
+        "check_id": result.check_id,
+        "entity": result.entity,
+        "severity": result.severity,
+    }
+    value = result.metric_value
+    lines = [
+        _emit("dq_check_status", labels, STATUS_VALUE.get(result.status, 3)),
+        _emit("dq_check_duration_seconds", labels, result.duration_ms / 1000.0),
+    ]
+    if result.rows_examined is not None:
+        lines.append(_emit("dq_check_rows_examined", labels, result.rows_examined))
+    if value is not None:
+        lines.append(_emit("dq_metric_value", labels, value))
+    if result.unit == "hours" and value is not None:
+        lines.append(_emit("dq_freshness_hours", {"entity": result.entity}, value))
+    if result.unit == "rows" and value is not None:
+        lines.append(_emit("dq_rows_loaded", {"entity": result.entity}, value))
+    lines.append(_emit("dq_checks_total", {"status": result.status}, 1))
+    return lines
+
+
 def render(
     results: Iterable[CheckResult],
     run_ts: datetime | None = None,
     open_incidents: Mapping[str, int] | None = None,
 ) -> str:
+    """Prometheus textfile body: HELP/TYPE header, per-check series, run stamp."""
     results = list(results)
     moment = run_ts or datetime.now(timezone.utc)
     stamp = int(moment.timestamp())
-    lines: list[str] = []
-
-    def emit(name: str, labels: dict[str, object], value: float) -> None:
-        lines.append(f"{name}{_labels(**labels)} {value}")
-
-    for name, (metric_type, description) in HELP.items():
-        lines.append(f"# HELP {name} {description}")
-        lines.append(f"# TYPE {name} {metric_type}")
-
-    for result in results:
-        labels = {
-            "check_id": result.check_id,
-            "entity": result.entity,
-            "severity": result.severity,
-        }
-        emit("dq_check_status", labels, STATUS_VALUE.get(result.status, 3))
-        emit("dq_check_duration_seconds", labels, result.duration_ms / 1000.0)
-        if result.rows_examined is not None:
-            emit("dq_check_rows_examined", labels, result.rows_examined)
-        if result.metric_value is not None:
-            emit("dq_metric_value", labels, result.metric_value)
-        if result.unit == "hours" and result.metric_value is not None:
-            emit("dq_freshness_hours", {"entity": result.entity}, result.metric_value)
-        if result.unit == "rows" and result.metric_value is not None:
-            emit("dq_rows_loaded", {"entity": result.entity}, result.metric_value)
-        emit("dq_checks_total", {"status": result.status}, 1)
-
-    for severity, count in sorted((open_incidents or {}).items()):
-        emit("dq_incident_open", {"severity": severity}, count)
-
-    emit("dq_run_timestamp_seconds", {}, stamp)
+    lines = [
+        *_header_lines(),
+        *[line for result in results for line in _result_lines(result)],
+        *[
+            _emit("dq_incident_open", {"severity": severity}, count)
+            for severity, count in sorted((open_incidents or {}).items())
+        ],
+        _emit("dq_run_timestamp_seconds", {}, stamp),
+    ]
     return "\n".join(lines) + "\n"
 
 

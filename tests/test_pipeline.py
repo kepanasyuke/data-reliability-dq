@@ -13,48 +13,62 @@ from reliability.db import Database
 from reliability.metrics import render
 from reliability.synth import build_demo
 
+EXPECTED_FAILURES = {
+    "client.inn.valid",
+    "client.ogrn.valid",
+    "client.segment.completeness",
+    "turnover.duplicate_grain",
+    "turnover.orphan_client",
+    "turnover.balance_non_negative",
+    "turnover.balance_continuity",
+    "turnover.volume_anomaly",
+    "loans.freshness",
+    "loans.debt_within_limit",
+    "batch.rowcount_match",
+}
 
-def test_defects_are_detected_and_then_resolved(settings: Config, repo_root: Path) -> None:
+
+def _broken_run(settings: Config, repo_root: Path) -> tuple[set[str], list[dict], list[dict]]:
+    """Seed the defective warehouse and run the catalogue over it."""
     with Database(settings.database_path) as db:
         store.ensure_schema(db)
         build_demo(db, repo_root, inject_defects=True, seed=7)
         broken = execute_run(settings, db, verbose=False)
         failed = {result.check_id for result in broken["results"] if result.failed}
-
-        # каждый внесённый дефект должен быть пойман своей проверкой
-        assert {
-            "client.inn.valid",
-            "client.ogrn.valid",
-            "client.segment.completeness",
-            "turnover.duplicate_grain",
-            "turnover.orphan_client",
-            "turnover.balance_non_negative",
-            "turnover.balance_continuity",
-            "turnover.volume_anomaly",
-            "loans.freshness",
-            "loans.debt_within_limit",
-            "batch.rowcount_match",
-        } <= failed
-        # свежесть оборотов не должна страдать: данные приехали вовремя
-        assert "turnover.freshness" not in failed
-
         opened = incidents.open_incidents(db)
-        assert len(opened) == len(failed)
-        assert {row["severity"] for row in opened} <= {"P1", "P2", "P3"}
+    return failed, opened
 
+
+def _healthy_run(settings: Config, repo_root: Path) -> tuple[dict, list[dict], dict]:
+    """Reload the same warehouse cleanly and run the catalogue again."""
     with Database(settings.database_path) as db:
         store.ensure_schema(db)
         build_demo(db, repo_root, inject_defects=False, seed=7)
         healthy = execute_run(settings, db, verbose=False)
-
-        assert all(result.status == PASS for result in healthy["results"]), [
-            (r.check_id, r.status, r.message) for r in healthy["results"] if r.status != PASS
-        ]
-        assert incidents.open_incidents(db) == []
-
+        remaining = incidents.open_incidents(db)
         stats = incidents.mttr(db)
-        assert stats["overall"]["resolved"] == len(failed)
-        assert stats["overall"]["avg_minutes"] >= 0
+    return healthy, remaining, stats
+
+
+def test_defects_are_detected_and_then_resolved(settings: Config, repo_root: Path) -> None:
+    failed, opened = _broken_run(settings, repo_root)
+
+    # каждый внесённый дефект должен быть пойман своей проверкой
+    assert EXPECTED_FAILURES <= failed
+    # свежесть оборотов не должна страдать: данные приехали вовремя
+    assert "turnover.freshness" not in failed
+
+    assert len(opened) == len(failed)
+    assert {row["severity"] for row in opened} <= {"P1", "P2", "P3"}
+
+    healthy, remaining, stats = _healthy_run(settings, repo_root)
+
+    assert all(result.status == PASS for result in healthy["results"]), [
+        (r.check_id, r.status, r.message) for r in healthy["results"] if r.status != PASS
+    ]
+    assert remaining == []
+    assert stats["overall"]["resolved"] == len(failed)
+    assert stats["overall"]["avg_minutes"] >= 0
 
     assert settings.report_path.exists()
     assert "Отчёт Data Quality" in settings.report_path.read_text(encoding="utf-8")
