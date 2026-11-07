@@ -25,6 +25,14 @@ CREATE SCHEMA IF NOT EXISTS stage;
 -- Клиентов ~ сотни тысяч, join к факту идёт постоянно, поэтому
 -- DISTRIBUTED REPLICATED: каждая сегмента не делает redistribute,
 -- а broadcast-джойн к маленькому справочнику всегда дешевле.
+--
+-- PRIMARY KEY здесь НЕ объявляется: Greenplum 6 не поддерживает
+-- уникальные индексы и PK на appendonly-таблицах
+-- ("append-only tables do not support unique indexes"). Выбор сделан в
+-- пользу AO+column+zstd, как и у фактов: уникальность client_id
+-- обеспечивает загрузчик (upsert по client_id) и DQ-проверка
+-- client.inn.valid/дубликатов справочника. В Greenplum 7 PK на AO-таблице
+-- уже допустим - при переходе на 7.x ограничение можно вернуть.
 -- ---------------------------------------------------------------------
 CREATE TABLE mart.dim_client (
     client_id       varchar(20)  NOT NULL,
@@ -35,8 +43,7 @@ CREATE TABLE mart.dim_client (
     manager_id      varchar(20),
     opened_dt       date,
     closed_dt       date,
-    load_dt         timestamp NOT NULL DEFAULT now(),
-    CONSTRAINT dim_client_pk PRIMARY KEY (client_id)
+    load_dt         timestamp NOT NULL DEFAULT now()
 )
 WITH (appendonly = true, orientation = column, compresstype = zstd, compresslevel = 3)
 DISTRIBUTED REPLICATED;

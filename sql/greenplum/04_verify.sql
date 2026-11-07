@@ -48,6 +48,10 @@ SELECT n.nspname || '.' || c.relname     AS table_name,
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname IN ('mart', 'ops')
    AND c.relkind IN ('r', 'p')
+   AND NOT EXISTS (SELECT 1
+                     FROM pg_partitions p
+                    WHERE p.schemaname = n.nspname
+                      AND p.partitiontablename = c.relname)
  ORDER BY 1;
 
 
@@ -121,13 +125,19 @@ SELECT n.nspname || '.' || c.relname AS table_name,
   JOIN pg_class c     ON c.oid = a.relid
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname IN ('mart', 'ops')
+   AND NOT EXISTS (SELECT 1
+                     FROM pg_partitions p
+                    WHERE p.schemaname = n.nspname
+                      AND p.partitiontablename = c.relname)
  ORDER BY 1;
 
 
 -- ---------------------------------------------------------------------
 -- БЛОК 6. Ключи и индексы.
--- Ожидаем: PK у dim_client, etl_batch, dq_result, dq_incident;
--- idx_turnover_client и idx_incident_open на месте.
+-- Ожидаем PK у etl_batch, dq_result, dq_incident, dq_catalog.
+-- У mart.dim_client PK нет намеренно: Greenplum 6 не разрешает
+-- уникальные индексы на appendonly-таблицах.
+-- idx_turnover_client и idx_incident_open должны быть на месте.
 -- ---------------------------------------------------------------------
 SELECT n.nspname || '.' || c.relname AS table_name,
        con.conname                   AS constraint_name,
@@ -160,6 +170,10 @@ SELECT n.nspname || '.' || c.relname                         AS table_name,
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname IN ('mart', 'ops')
    AND c.relkind IN ('r', 'p')
+   AND NOT EXISTS (SELECT 1
+                     FROM pg_partitions p
+                    WHERE p.schemaname = n.nspname
+                      AND p.partitiontablename = c.relname)
  ORDER BY pg_total_relation_size(c.oid) DESC;
 
 SELECT skcnamespace::text || '.' || skcrelname AS table_name,
@@ -184,6 +198,10 @@ SELECT n.nspname || '.' || c.relname AS table_name,
   LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
  WHERE n.nspname IN ('mart', 'ops')
    AND c.relkind IN ('r', 'p')
+   AND NOT EXISTS (SELECT 1
+                     FROM pg_partitions p
+                    WHERE p.schemaname = n.nspname
+                      AND p.partitiontablename = c.relname)
  ORDER BY s.last_analyze NULLS FIRST, 1;
 
 

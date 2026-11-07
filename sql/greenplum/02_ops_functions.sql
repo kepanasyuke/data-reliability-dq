@@ -100,7 +100,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION ops.dq_register_failure IS
+COMMENT ON FUNCTION ops.dq_register_failure(varchar, varchar, varchar, varchar, numeric, varchar, varchar, text) IS
     'Идемпотентная регистрация инцидента: повторный вызов по тому же check_id+entity увеличивает occurrences';
 
 -- ---------------------------------------------------------------------
@@ -162,9 +162,15 @@ $$;
 
 -- ---------------------------------------------------------------------
 -- Процедура "прогнать каталог проверок" для случая, когда DQ нужно
--- вызвать извне (Airflow BashOperator -> psql -c "CALL ops.dq_run_all(...)").
+-- вызвать извне (Airflow BashOperator -> psql -c "...").
 -- Реестр проверок читается из ops.dq_catalog, чтобы не тащить
 -- Python туда, где его нет.
+--
+-- Важно про версии: в Greenplum 6 (PostgreSQL 9.4) конструкции
+-- CREATE PROCEDURE нет, поэтому здесь функция RETURNS void и вызов:
+--     SELECT ops.dq_run_all('run-2026-11-07');
+-- В Greenplum 7 этот же код можно объявить как PROCEDURE и вызывать
+-- через CALL ops.dq_run_all('run-...').
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ops.dq_catalog (
     check_id   varchar(120) PRIMARY KEY,
@@ -178,7 +184,8 @@ CREATE TABLE IF NOT EXISTS ops.dq_catalog (
 )
 DISTRIBUTED REPLICATED;
 
-CREATE OR REPLACE PROCEDURE ops.dq_run_all(p_run_id varchar, p_owner varchar DEFAULT 'data-reliability@bank.local')
+CREATE OR REPLACE FUNCTION ops.dq_run_all(p_run_id varchar, p_owner varchar DEFAULT 'data-reliability@bank.local')
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -228,5 +235,5 @@ BEGIN
 END;
 $$;
 
-COMMENT ON PROCEDURE ops.dq_run_all(varchar, varchar) IS
+COMMENT ON FUNCTION ops.dq_run_all(varchar, varchar) IS
     'Последовательный прогон каталога ops.dq_catalog с записью результатов и синхронизацией инцидентов';
