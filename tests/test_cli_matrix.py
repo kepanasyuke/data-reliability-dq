@@ -8,8 +8,17 @@ from pathlib import Path
 import pytest
 
 from reliability import incidents, store
-from reliability.checks import FAIL, CheckResult
-from reliability.cli import build_parser, cmd_ack, cmd_init, cmd_report, cmd_resolve, main
+from reliability.checks import ERROR, FAIL, PASS, WARN, CheckResult
+from reliability.cli import (
+    _failed_count,
+    _print_demo_summary,
+    build_parser,
+    cmd_ack,
+    cmd_init,
+    cmd_report,
+    cmd_resolve,
+    main,
+)
 from reliability.db import Database
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -194,3 +203,28 @@ def test_cmd_resolve_reports_note(config_file: Path, capsys) -> None:
     args = build_parser().parse_args(["resolve", events[0]["incident_id"], "--note", "перезалили"])
     assert cmd_resolve(config, args) == 0
     assert "перезалили" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status,expected", [(PASS, 0), (WARN, 0), (FAIL, 1), (ERROR, 1)])
+def test_failed_count_per_status(status: str, expected: int) -> None:
+    assert _failed_count([_result(status)]) == expected
+
+
+def test_failed_count_sums_failures_and_errors() -> None:
+    assert _failed_count([_result(FAIL), _result(ERROR), _result(PASS), _result(WARN)]) == 2
+
+
+def test_failed_count_of_empty_run_is_zero() -> None:
+    assert _failed_count([]) == 0
+
+
+def test_demo_summary_shows_failure_count_and_exit_code(capsys, tmp_path: Path) -> None:
+    results = [_result(FAIL), _result(ERROR), _result(PASS)]
+    stats = {
+        "overall": {"resolved": 2, "avg_minutes": 1.8, "max_minutes": 3.0},
+        "by_severity": {"P1": {"resolved": 2, "avg_minutes": 1.8, "max_minutes": 3.0}},
+    }
+    _print_demo_summary(1, results, [], stats, tmp_path / "incident.md", tmp_path / "resolved.md")
+    out = capsys.readouterr().out
+    assert "2 проверок с FAIL/ERROR, exit code 1" in out
+    assert "P1: 1.8 мин (2 шт.)" in out

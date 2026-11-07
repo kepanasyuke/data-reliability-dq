@@ -1,6 +1,7 @@
 """Command line interface.
 
-    python run.py seed --defects     # build the demo warehouse with injected failures
+    python run.py seed               # build the demo warehouse with injected failures
+    python run.py seed --clean       # rebuild it cleanly (the recovery step)
     python run.py run                # run the DQ catalogue, sync incidents, export metrics
     python run.py status             # open incidents, MTTR, SLA breaches
     python run.py demo               # full story: incident -> fix -> auto-resolve -> MTTR
@@ -296,14 +297,20 @@ def _demo_healthy_run(config: Config) -> tuple[Path, list[dict[str, Any]], dict[
     return resolved_report, remaining, stats_after
 
 
+def _failed_count(results: Sequence[CheckResult]) -> int:
+    """How many checks ended in FAIL or ERROR."""
+    return sum(1 for result in results if result.failed)
+
+
 def _print_demo_summary(
     code: int,
+    results: Sequence[CheckResult],
     remaining: Sequence[Mapping[str, Any]],
     stats_after: Mapping[str, Any],
     incident_report: Path,
     resolved_report: Path,
 ) -> None:
-    print(f"  прогон с дефектами: {code} проверок с FAIL/ERROR, exit code {code}")
+    print(f"  прогон с дефектами: {_failed_count(results)} проверок с FAIL/ERROR, exit code {code}")
     print(f"  открытых инцидентов после восстановления: {len(remaining)}")
     overall = stats_after["overall"]
     if overall["resolved"]:
@@ -327,7 +334,9 @@ def cmd_demo(config: Config, args: argparse.Namespace) -> int:
     resolved_report, remaining, stats_after = _demo_healthy_run(config)
 
     _step("ИТОГ")
-    _print_demo_summary(code, remaining, stats_after, incident_report, resolved_report)
+    _print_demo_summary(
+        code, broken["results"], remaining, stats_after, incident_report, resolved_report
+    )
     return 0
 
 
