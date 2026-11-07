@@ -19,13 +19,58 @@ import base64
 import json
 import re
 import threading
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 LABEL_JQL = re.compile(r'labels\s*=\s*"([^"]+)"')
 ISSUE_PREFIX = "/rest/api/2/issue/"
 SEARCH_PATH = "/rest/api/2/search"
+
+BOARD_TEMPLATE = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Jira mock · DQ-инциденты</title>
+<style>
+ body {{ font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #f6f7fb; color: #202630; }}
+ header {{ background: #1f2c3e; color: #fff; padding: 22px 32px; }}
+ h1 {{ margin: 0 0 6px; font-size: 22px; }}
+ header p {{ margin: 0; color: #c7d0de; font-size: 14px; }}
+ main {{ padding: 24px 32px 48px; }}
+ table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(20,30,50,.08); }}
+ th, td {{ text-align: left; padding: 10px 14px; border-bottom: 1px solid #e6e9f0; font-size: 14px; }}
+ th {{ background: #f0f3f8; color: #3c4a5e; font-weight: 600; }}
+ td.key {{ font-family: Consolas, monospace; font-weight: 600; }}
+ .p1 {{ color: #c63434; font-weight: 600; }}
+ .p2 {{ color: #d67814; font-weight: 600; }}
+ .p3 {{ color: #5a6478; }}
+ .empty {{ padding: 28px; text-align: center; color: #6e7682; }}
+ footer {{ margin-top: 18px; color: #6e7682; font-size: 13px; }}
+ code {{ background: #eef1f6; padding: 2px 6px; border-radius: 4px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Jira mock · очередь DQ-инцидентов</h1>
+  <p>задач: {total} · проект {project} · данные из <code>reliability.jira</code></p>
+</header>
+<main>
+  <table>
+    <thead><tr><th>Key</th><th>Приоритет</th><th>Метки</th><th>Тема</th></tr></thead>
+    <tbody>
+      {rows}
+    </tbody>
+  </table>
+  <footer>
+    Создать задачи: <code>python run.py jira --url http://127.0.0.1:&lt;port&gt;</code> ·
+    JSON: <code>/issues</code>, <code>/rest/api/2/search?jql=labels="dq:DQ-00001"</code>
+  </footer>
+</main>
+</body>
+</html>
+"""
 
 
 class IssueStore:
@@ -80,6 +125,43 @@ def _respond(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, An
     handler.wfile.write(body)
 
 
+def _respond_html(handler: BaseHTTPRequestHandler, status: int, document: str) -> None:
+    body = document.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _severity_class(labels: Sequence[str]) -> str:
+    found = [label.split(":", 1)[1] for label in labels if label.startswith("severity:")]
+    return (found[0] if found else "P3").lower()
+
+
+def _board_row(issue: Mapping[str, Any]) -> str:
+    fields = issue["fields"]
+    labels = [str(item) for item in (fields.get("labels") or [])]
+    priority = escape(str((fields.get("priority") or {}).get("name", "")))
+    return (
+        f'<tr><td class="key">{escape(str(issue["key"]))}</td>'
+        f'<td class="{_severity_class(labels)}">{priority}</td>'
+        f"<td>{escape(', '.join(labels))}</td>"
+        f"<td>{escape(str(fields.get('summary', '')))}</td></tr>"
+    )
+
+
+def _board_html(issues: Sequence[Mapping[str, Any]]) -> str:
+    """HTML-доска для браузера: то, что открывают после ``run.py jira``."""
+    rows = "".join(_board_row(issue) for issue in issues) or (
+        '<tr><td colspan="4" class="empty">задач пока нет — выполните '
+        "<code>python run.py jira</code></td></tr>"
+    )
+    projects = {str((issue["fields"].get("project") or {}).get("key", "")) for issue in issues}
+    project = next(iter(projects - {""}), "DQ")
+    return BOARD_TEMPLATE.format(total=len(issues), project=escape(project), rows=rows)
+
+
 def _authorized(handler: BaseHTTPRequestHandler, token: str) -> bool:
     if not token:
         return True
@@ -102,7 +184,9 @@ def _handle_search(handler: BaseHTTPRequestHandler, store: IssueStore, query: st
 
 
 def _handle_get(handler: BaseHTTPRequestHandler, store: IssueStore, path: str) -> None:
-    if path == "/health":
+    if path in ("/", "/board"):
+        _respond_html(handler, 200, _board_html(store.all()))
+    elif path == "/health":
         _respond(handler, 200, {"status": "ok", "issues": len(store.all())})
     elif path == "/issues":
         issues = store.all()

@@ -84,6 +84,11 @@ def _http(url: str, method: str = "GET", body: dict | None = None) -> tuple[int,
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
 
 
+def _http_text(url: str) -> tuple[int, str, str]:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.status, response.headers.get("Content-Type", ""), response.read().decode("utf-8")
+
+
 # -- payload ----------------------------------------------------------------
 @pytest.mark.parametrize(
     "severity,expected",
@@ -346,3 +351,37 @@ def test_main_runs_jira_command(tmp_path: Path, capsys) -> None:
     assert main(["--config", str(config_file), "init"]) == 0
     assert main(["--config", str(config_file), "jira"]) == 0
     assert "Jira:" in capsys.readouterr().out
+
+
+def test_board_empty_state(mock_jira) -> None:
+    base_url, _ = mock_jira
+    status, content_type, html = _http_text(f"{base_url}/")
+    assert (status, "text/html" in content_type) == (200, True)
+    assert "задач: 0" in html
+    assert "задач пока нет" in html
+
+
+def test_board_lists_created_issues(mock_jira) -> None:
+    base_url, _ = mock_jira
+    jira.push_events([EVENT], "RUN-1", jira.JiraConfig(base_url=base_url))
+    _, _, html = _http_text(f"{base_url}/")
+    assert "DQ-1" in html
+    assert "Highest" in html
+    assert "severity:P1" in html
+    assert "turnover.orphan_client" in html
+
+
+def test_board_marks_severity_class(mock_jira) -> None:
+    base_url, _ = mock_jira
+    jira.push_events([{**EVENT, "severity": "P2"}], "RUN-1", jira.JiraConfig(base_url=base_url))
+    _, _, html = _http_text(f"{base_url}/board")
+    assert 'class="p2"' in html
+
+
+def test_board_escapes_summary(mock_jira) -> None:
+    base_url, _ = mock_jira
+    event = {**EVENT, "check_id": "<script>alert(1)</script>"}
+    jira.push_events([event], "RUN-1", jira.JiraConfig(base_url=base_url))
+    _, _, html = _http_text(f"{base_url}/")
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html

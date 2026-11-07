@@ -98,7 +98,7 @@ python run.py status        # открытые инциденты, MTTR, нар�
 python run.py demo          # полный сценарий: дефекты -> инцидент -> восстановление
 python run.py report        # что упало в последнем прогоне
 python run.py jira          # план задач в Jira (dry-run, без сети)
-python -m pytest -q         # 979 тестов, включая e2e-сценарий
+python -m pytest -q         # 983 теста, включая e2e-сценарий
 ```
 
 ```bash
@@ -314,6 +314,10 @@ python run.py jira --url http://127.0.0.1:8099 # задачи по открыт�
 python run.py jira                             # dry-run: показать план без отправки
 ```
 
+После первого прогона в браузере открывается доска `http://127.0.0.1:8099/` —
+HTML-таблица задач с приоритетами и метками; JSON-эндпоинты (`/issues`,
+`/rest/api/2/search`) остаются для клиента и тестов.
+
 Настоящая Jira настраивается в `config/demo.json`: `notify.jira_url`,
 `notify.jira_project`, `notify.jira_user`, `notify.jira_token` (логин + API-токен,
 Basic-авторизация). По каждому инциденту CLI печатает `CREATED` / `EXISTING` /
@@ -353,7 +357,7 @@ sql/greenplum/02_ops_functions.sql  функции и процедуры соп�
 sql/greenplum/03_checks.sql    проверки в редакции Greenplum + здоровье кластера
 dags/dq_runtime_dag.py         DQ каждые 30 минут, эскалация P1
 dags/mart_freshness_sla_dag.py SLA-контур готовности mart к 08:30
-tests/                         979 тестов: валидаторы, каталог, пороги, отчёт, CLI, Jira, генератор, e2e
+tests/                         983 теста: валидаторы, каталог, пороги, отчёт, CLI, Jira, генератор, e2e
 tools/render_assets.py         PNG-таблицы и GIF для README (Pillow)
 tools/jira_mock.py             запуск мока Jira одной командой
 docs/images/                   иллюстрации для README
@@ -363,7 +367,7 @@ docs/                          архитектура, runbook, MPP-заметк
 ## Тесты и CI
 
 ```bash
-python -m pytest -q            # 979 тестов
+python -m pytest -q            # 983 теста
 make test                      # то же через Makefile
 make demo                      # сквозной сценарий
 ```
@@ -379,7 +383,7 @@ make demo                      # сквозной сценарий
 | `tests/test_report_metrics_matrix.py` | 60 | форматирование отчёта, секции, экранирование меток Prometheus |
 | `tests/test_db_store_matrix.py` | 41 | макросы диалектов, плейсхолдеры, ops-таблицы |
 | `tests/test_cli_matrix.py` | 39 | разбор аргументов, коды возврата, тексты для дежурной смены |
-| `tests/test_jira_matrix.py` | 42 | payload v2, дедуп по метке, мок-сервер Jira, команда `jira` |
+| `tests/test_jira_matrix.py` | 46 | payload v2, дедуп по метке, мок-сервер Jira и HTML-доска, команда `jira` |
 | `tests/test_validators.py` | 16 | известные ИНН/ОГРН и «похожие, но неверные» строки |
 | `tests/test_checks.py` | 10 | пороги, каталог, exit-коды |
 | `tests/test_incidents.py` | 6 | дедупликация, авто-закрытие, MTTR, SLA |
