@@ -24,10 +24,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
-from reliability import incidents, store  # noqa: E402
+from reliability import incidents, jira, store  # noqa: E402
 from reliability.cli import execute_run  # noqa: E402
 from reliability.config import Config, load_config  # noqa: E402
 from reliability.db import Database  # noqa: E402
+from reliability.jira_mock import create_server  # noqa: E402
 from reliability.synth import build_demo  # noqa: E402
 
 OUT_DIR = REPO_ROOT / "docs" / "images"
@@ -75,11 +76,12 @@ def _table_geometry(headers: Sequence[str], widths: Sequence[int]) -> tuple[int,
 
 
 def _draw_header(draw: ImageDraw.ImageDraw, headers: Sequence[str], widths: Sequence[int]) -> None:
-    draw.rectangle([0, 0, sum(widths) + 48, 104], fill=(255, 255, 255))
-    draw.text((24, 18), "", font=_font(18, True), fill=INK)
+    right = sum(widths) + 48
+    draw.rectangle([0, 56, right, 104], fill=(255, 255, 255))
+    draw.line([0, 104, right, 104], fill=(222, 226, 234), width=1)
     x = 24
     for header, width in zip(headers, widths, strict=True):
-        draw.text((x, 62), header, font=_font(17, True), fill=HEAD_BG)
+        draw.text((x, 66), header, font=_font(17, True), fill=HEAD_BG)
         x += width
 
 
@@ -259,6 +261,46 @@ def _gif_frames(collected: dict[str, Any]) -> list[Image.Image]:
 
 
 # -- основной сценарий ------------------------------------------------------
+def _jira_rows(issues: Sequence[dict[str, Any]]) -> tuple[list[list[Any]], list[list[tuple[int, int, int] | None]]]:
+    rows: list[list[Any]] = []
+    colors: list[list[tuple[int, int, int] | None]] = []
+    for issue in issues:
+        fields = issue["fields"]
+        severity = str(fields["labels"][1]).split(":", 1)[-1]
+        rows.append(
+            [
+                issue["key"],
+                fields["priority"]["name"],
+                f"severity:{severity}",
+                fields["summary"][:56],
+            ]
+        )
+        colors.append([None, SEVERITY_COLORS.get(severity), None, None])
+    return rows, colors
+
+
+def _render_jira(collected: dict[str, Any]) -> Path:
+    """Поднять мок Jira, поставить задачи по инцидентам и нарисовать очередь."""
+    server, issue_store = create_server()
+    host, port = server.server_address[:2]
+    settings = jira.JiraConfig(base_url=f"http://{host}:{port}", project="DQ")
+    events = jira.events_from_incidents(collected["incidents"])
+    results = jira.push_events(events, collected["broken"]["run_id"], settings)
+    issues = issue_store.all()
+    server.shutdown()
+    rows, colors = _jira_rows(issues)
+    created = sum(1 for item in results if item["action"] == "CREATED")
+    return _save_table(
+        OUT_DIR / "jira_issues.png",
+        "Jira · задачи по DQ-инцидентам",
+        f"мок Jira REST v2 {host}:{port} · создано {created} задач · дедуп по метке dq:<incident_id>",
+        ["Key", "Приоритет", "Метка", "Тема"],
+        rows,
+        [90, 130, 150, 620],
+        colors,
+    )
+
+
 def _metrics_excerpt() -> list[str]:
     path = REPO_ROOT / "artifacts" / "metrics" / "dq.prom"
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
@@ -329,10 +371,11 @@ def main() -> int:
     )
 
     metrics_path = _metrics_image(_metrics_excerpt())
+    jira_path = _render_jira(collected)
     print(f"готово: {len(frames)} кадров GIF")
     for path in sorted(OUT_DIR.glob("*")):
         print(f"  {path.relative_to(REPO_ROOT)}  {path.stat().st_size // 1024} КБ")
-    return 0 if metrics_path.exists() else 1
+    return 0 if jira_path.exists() and metrics_path.exists() else 1
 
 
 if __name__ == "__main__":

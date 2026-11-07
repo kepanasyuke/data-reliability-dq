@@ -97,7 +97,8 @@ python run.py run           # каталог проверок, инцидент�
 python run.py status        # открытые инциденты, MTTR, нарушения SLA
 python run.py demo          # полный сценарий: дефекты -> инцидент -> восстановление
 python run.py report        # что упало в последнем прогоне
-python -m pytest -q         # 930 тестов, включая e2e-сценарий
+python run.py jira          # план задач в Jira (dry-run, без сети)
+python -m pytest -q         # 979 тестов, включая e2e-сценарий
 ```
 
 ```bash
@@ -294,6 +295,30 @@ PASS ──► авто-закрытие с записью run_id в resolution_
 - SLA реакции: P1 — 15 мин, P2 — 60 мин, P3 — 240 мин (`incidents.SEVERITY_SLA_MINUTES`);
 - нарушения SLA попадают в отчёт и в отдельный Airflow-таск.
 
+## Jira: инциденты → задачи
+
+Инцидент должен попадать не только в отчёт, но и в трекер, где его берут в работу.
+`src/reliability/jira.py` ставит задачи через Jira REST v2 (`POST /rest/api/2/issue`):
+приоритет строится из severity (P1→Highest, P2→High, P3→Medium), в метки идут
+`reliability-dq`, `severity:*`, `run:*` и `dq:<incident_id>`. Дедупликация — по
+последней метке: повторный прогон находит существующую задачу и возвращает
+`EXISTING`, а не создаёт дубль — так же, как `sync_incidents` не плодит инциденты.
+
+![Очередь DQ-инцидентов в Jira](docs/images/jira_issues.png)
+
+Локальный мок Jira (только Python — без Docker, Java и лицензии Atlassian):
+
+```bash
+python tools/jira_mock.py --port 8099          # мок Jira REST v2 в отдельном терминале
+python run.py jira --url http://127.0.0.1:8099 # задачи по открытым инцидентам
+python run.py jira                             # dry-run: показать план без отправки
+```
+
+Настоящая Jira настраивается в `config/demo.json`: `notify.jira_url`,
+`notify.jira_project`, `notify.jira_user`, `notify.jira_token` (логин + API-токен,
+Basic-авторизация). По каждому инциденту CLI печатает `CREATED` / `EXISTING` /
+`DRY_RUN`, а ошибки сети и HTTP отдаются кодом возврата 2.
+
 ## Соответствие требованиям вакансии
 
 | Ожидание из вакансии | Чем подтверждается в коде |
@@ -316,18 +341,21 @@ src/reliability/checks.py      движок проверок и порогов, 
 src/reliability/validators.py  ИНН/ОГРН: контрольные числа
 src/reliability/store.py       таблицы ops_dq_result / ops_dq_incident
 src/reliability/incidents.py   жизненный цикл инцидента, MTTR, SLA, вебхук
+src/reliability/jira.py        Jira REST v2: задачи по инцидентам, дедуп по метке
+src/reliability/jira_mock.py   локальный мок Jira REST v2 (stdlib, без лицензии)
 src/reliability/report.py      markdown-отчёт с примерами строк
 src/reliability/metrics.py     Prometheus textfile
 src/reliability/synth.py       генератор демо-данных с дефектами
-src/reliability/cli.py         init / seed / run / status / ack / resolve / demo
+src/reliability/cli.py         init / seed / run / status / ack / resolve / report / jira / demo
 sql/demo/01_schema.sql         демо-схема (SQLite)
 sql/greenplum/01_mart_ddl.sql  прод-DDL: распределение, партиции, хранение
 sql/greenplum/02_ops_functions.sql  функции и процедуры сопровождения
 sql/greenplum/03_checks.sql    проверки в редакции Greenplum + здоровье кластера
 dags/dq_runtime_dag.py         DQ каждые 30 минут, эскалация P1
 dags/mart_freshness_sla_dag.py SLA-контур готовности mart к 08:30
-tests/                         930 тестов: валидаторы, каталог, пороги, отчёт, CLI, генератор, e2e
+tests/                         979 тестов: валидаторы, каталог, пороги, отчёт, CLI, Jira, генератор, e2e
 tools/render_assets.py         PNG-таблицы и GIF для README (Pillow)
+tools/jira_mock.py             запуск мока Jira одной командой
 docs/images/                   иллюстрации для README
 docs/                          архитектура, runbook, MPP-заметки, каталог проверок
 ```
@@ -335,7 +363,7 @@ docs/                          архитектура, runbook, MPP-заметк
 ## Тесты и CI
 
 ```bash
-python -m pytest -q            # 930 тестов
+python -m pytest -q            # 979 тестов
 make test                      # то же через Makefile
 make demo                      # сквозной сценарий
 ```
@@ -351,6 +379,7 @@ make demo                      # сквозной сценарий
 | `tests/test_report_metrics_matrix.py` | 60 | форматирование отчёта, секции, экранирование меток Prometheus |
 | `tests/test_db_store_matrix.py` | 41 | макросы диалектов, плейсхолдеры, ops-таблицы |
 | `tests/test_cli_matrix.py` | 39 | разбор аргументов, коды возврата, тексты для дежурной смены |
+| `tests/test_jira_matrix.py` | 42 | payload v2, дедуп по метке, мок-сервер Jira, команда `jira` |
 | `tests/test_validators.py` | 16 | известные ИНН/ОГРН и «похожие, но неверные» строки |
 | `tests/test_checks.py` | 10 | пороги, каталог, exit-коды |
 | `tests/test_incidents.py` | 6 | дедупликация, авто-закрытие, MTTR, SLA |
@@ -376,8 +405,9 @@ CI (`.github/workflows/ci.yml`): матрица Python 3.10–3.13, `pytest`, с
   `sql/greenplum/`. Диалектные различия изолированы в `db.compile_sql`
   (макрос `{{ age_hours('col') }}` и стиль плейсхолдеров).
 - Демо-данные синтетические (320 клиентов, 959 счетов, ~57 тыс. строк оборотов).
-- Нотификации пишутся в `artifacts/notifications.jsonl` (dry-run), а не в чат и
-  не в Jira: в проекте нет корпоративных креденшелов.
+- Нотификации пишутся в `artifacts/notifications.jsonl`; постановка задач проверена
+  на локальном моке Jira (`tools/jira_mock.py`). Корпоративных креденшелов в
+  репозитории нет — настоящая Jira подключается через `notify.jira_*` в конфиге.
 
 ## Лицензия
 

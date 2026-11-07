@@ -16,6 +16,10 @@
   "notify": {
     "channel": "#dq-alerts",
     "jira_project": "DQ",
+    "jira_url": "",
+    "jira_user": "",
+    "jira_token": "",
+    "jira_timeout": 5,
     "dry_run": true
   },
   "params": {}

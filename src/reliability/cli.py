@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import incidents, metrics, report, store
+from . import incidents, jira, metrics, report, store
 from .checks import CheckResult, CheckRunner, exit_code, load_checks
 from .config import Config, load_config
 from .db import Database
@@ -357,6 +357,42 @@ def cmd_report(config: Config, args: argparse.Namespace) -> int:
     return code
 
 
+def _print_jira(results: Sequence[Mapping[str, Any]], settings: jira.JiraConfig) -> None:
+    mode = settings.base_url if settings.enabled else "dry-run"
+    print(f"Jira: инцидентов {len(results)}, режим {mode}")
+    for item in results:
+        print(
+            f"  {item['incident_id']:<12} {item['action']:<9} "
+            f"{item.get('key') or '-':<8} {item['label']}"
+        )
+    if not settings.enabled:
+        print("подсказка: задайте notify.jira_url в конфиге или --url, чтобы отправить реально")
+
+
+def cmd_jira(config: Config, args: argparse.Namespace) -> int:
+    """Отправить открытые инциденты в Jira; без URL — dry-run с планом задач."""
+    with Database(config.database_path) as db:
+        store.ensure_schema(db)
+        open_list = incidents.open_incidents(db)
+
+    notify = dict(config.notify)
+    if args.url:
+        notify["jira_url"] = args.url
+    settings = jira.JiraConfig.from_notify(notify)
+    if getattr(args, "project", ""):
+        settings = jira.JiraConfig(**{**settings.__dict__, "project": args.project})
+    events = jira.events_from_incidents(open_list)
+
+    code = 0
+    try:
+        results = jira.push_events(events, args.run_id, settings)
+        _print_jira(results, settings)
+    except jira.JiraError as exc:
+        print(f"ошибка Jira: {exc}", file=sys.stderr)
+        code = 2
+    return code
+
+
 def _add_simple_parser(
     sub: argparse._SubParsersAction, name: str, help_text: str, func: Any
 ) -> argparse.ArgumentParser:
@@ -390,6 +426,18 @@ def _add_incident_parser(
     parser.set_defaults(func=func)
 
 
+def _add_jira_parser(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser("jira", help="отправить открытые инциденты в Jira")
+    parser.add_argument(
+        "--url",
+        default="",
+        help="базовый URL Jira (пусто — dry-run из notify.jira_url)",
+    )
+    parser.add_argument("--project", default="", help="ключ проекта, по умолчанию из конфига")
+    parser.add_argument("--run-id", default="MANUAL", help="метка прогона в labels")
+    parser.set_defaults(func=cmd_jira)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reliability",
@@ -405,6 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_incident_parser(sub, "ack", "взять инцидент в работу", cmd_ack)
     _add_incident_parser(sub, "resolve", "закрыть инцидент вручную", cmd_resolve)
     _add_simple_parser(sub, "report", "показать последний прогон", cmd_report)
+    _add_jira_parser(sub)
     _add_simple_parser(
         sub, "demo", "полный сценарий: дефекты -> инцидент -> восстановление", cmd_demo
     )
