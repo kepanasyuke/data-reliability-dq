@@ -142,6 +142,89 @@ node_exporter:
 скриншоты pgAdmin: проект запускается без кластера Greenplum. На прод-стенде те же
 таблицы лежат в схеме `ops` и снимаются из pgAdmin/Grafana.
 
+Изображения с префиксом `gp_` в разделе ниже — наоборот, сняты с реального
+кластера Greenplum 6.8.1, а не отрендерены из SQLite.
+
+## Локальный Greenplum 6.8.1 (диск D:)
+
+Демо на SQLite показывает логику проверок; этот же DDL реально прогнан на
+MPP-кластере, и метрики ниже сняты из живого каталога Greenplum.
+
+| Что | Где |
+| --- | --- |
+| WSL2 Ubuntu 24.04 + Docker | `D:\WSL\Ubuntu-GP` |
+| Greenplum 6.8.1 (`datagrip/greenplum:6.8`) | контейнер `gpdb`, `127.0.0.1:15432`, пользователь `gpadmin`, БД `postgres` |
+| Скрипт запуска кластера | `D:\WSL\start-greenplum.ps1` |
+| pgAdmin 4 | `D:\pgAdmin\runtime\pgAdmin4.exe`, сервер `Greenplum local (WSL2 + Docker)` уже заведён |
+| Загрузчик произвольных CSV | `D:\WSL\load-csv.py` |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\WSL\start-greenplum.ps1   # поднять кластер
+D:\pgAdmin\runtime\pgAdmin4.exe                                       # открыть pgAdmin
+```
+
+Порядок в Query Tool pgAdmin:
+
+1. `sql/greenplum/01_mart_ddl.sql` — схемы `mart`/`ops`/`stage`, таблицы, партиции.
+2. `sql/greenplum/02_ops_functions.sql` — функции `ops.dq_*` и `ops.dq_catalog`.
+3. Данные — `COPY` из CSV (в демо: `gp-export/sql/00_load_demo_data.sql`).
+4. `sql/greenplum/04_verify.sql` — распределение, партиции, сжатие, ключи.
+5. `SELECT ops.dq_run_all('run-2026-11-07');` — прогон 12 проверок в
+   `ops.dq_result` и синхронизация `ops.dq_incident`.
+
+Что показал прогон на кластере: 12 проверок, 10 `PASS`, 2 `FAIL` —
+`turnover.freshness` (30.3 ч при SLA 26) и `loans.freshness` (33.3 ч при SLA 24),
+потому что демо-данные старше SLA; 2 инцидента (`occurrences = 2`); 74 партиции
+в `mart` (по 37 на факт), сжатие `zstd`, перекос по сегментам ≈ 1.0.
+
+![Статусы проверок из Greenplum](docs/images/gp_checks_status.png)
+
+![Свежесть против SLA](docs/images/gp_freshness_vs_sla.png)
+
+![Строк оборотов по дням](docs/images/gp_daily_rows.png)
+
+![Перекос по сегментам](docs/images/gp_skew.png)
+
+Анимация прогона: титул → KPI → партиции по месяцам → свежесть против SLA →
+вердикт.
+
+![Анимация DQ-прогона](docs/images/gp_run_animation.gif)
+
+Ограничения Greenplum 6, найденные на живом кластере:
+
+- `appendonly`-таблица не может иметь PK/UNIQUE (`append-only tables do not
+  support unique indexes`) — у `mart.dim_client` ключ убран, уникальность держат
+  загрузчик и DQ-проверки;
+- PK обязан содержать все колонки `DISTRIBUTED BY` — отсюда составные ключи
+  `(batch_id, entity)` и `(incident_id, dedup_key)`;
+- ключ RANGE-партиции не может быть `varchar` — `month` хранится как `date`
+  (первое число месяца);
+- `percentile_cont` не работает как оконная функция — медиана в проверке №7
+  считается ранговым способом;
+- `CREATE PROCEDURE` появился только в GP 7 — `ops.dq_run_all` объявлена как
+  функция `RETURNS void` и вызывается через `SELECT`.
+
+Свои CSV (в том числе выгрузки с Kaggle):
+
+```powershell
+python D:\WSL\load-csv.py "C:\data\*.csv"      # одна или несколько таблиц сразу
+python D:\WSL\load-csv.py --schema stage "C:\data\a.csv"
+```
+
+Каждый файл превращается в `stage.<имя_файла>`: все колонки `text`,
+`DISTRIBUTED RANDOMLY`, после загрузки печатается число строк и список пустых
+колонок. Дальше типы кастуются в `mart`:
+
+```sql
+CREATE TABLE mart.x AS
+SELECT id::bigint, amount::numeric(20,2), dt::date, btrim(name) AS name
+  FROM stage.x;
+```
+
+Kaggle требует токен (`~/.kaggle/kaggle.json`) или `kaggle datasets download`,
+поэтому файл датасета скачивается локально и передаётся загрузчику — дальше это
+обычный `COPY`.
+
 ## Архитектура
 
 ```
