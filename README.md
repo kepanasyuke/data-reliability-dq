@@ -97,7 +97,7 @@ python run.py run           # каталог проверок, инцидент�
 python run.py status        # открытые инциденты, MTTR, нарушения SLA
 python run.py demo          # полный сценарий: дефекты -> инцидент -> восстановление
 python run.py report        # что упало в последнем прогоне
-python -m pytest -q         # 35 тестов, включая e2e-сценарий
+python -m pytest -q         # 930 тестов, включая e2e-сценарий
 ```
 
 ```bash
@@ -115,6 +115,32 @@ artifacts/dq_report.md             отчёт по последнему прог
 artifacts/metrics/dq.prom          Prometheus textfile (для node_exporter)
 artifacts/notifications.jsonl      пейлоады для чата/Jira
 ```
+
+## Как это выглядит
+
+Таблица результатов `ops_dq_result` на прогоне с дефектами и после перезаливки:
+
+![Результаты проверок с дефектами](docs/images/checks_table.png)
+
+![Результаты проверок после перезаливки](docs/images/checks_table_clean.png)
+
+Журнал инцидентов `ops_dq_incident` — приоритеты, дедупликация, счётчик повторов:
+
+![Журнал инцидентов](docs/images/incidents_table.png)
+
+Динамика метрик за шесть прогонов: дефекты → повторные прогоны без дублей тикетов
+→ перезаливка → все проверки зелёные, MTTR посчитан.
+
+![Динамика метрик](docs/images/dq_metrics.gif)
+
+Выгрузка Prometheus textfile (`artifacts/metrics/dq.prom`), которую забирает
+node_exporter:
+
+![Метрики dq.prom](docs/images/metrics_textfile.png)
+
+Картинки — рендеры демо-данных из SQLite (`python tools/render_assets.py`), а не
+скриншоты pgAdmin: проект запускается без кластера Greenplum. На прод-стенде те же
+таблицы лежат в схеме `ops` и снимаются из pgAdmin/Grafana.
 
 ## Архитектура
 
@@ -217,21 +243,45 @@ sql/greenplum/02_ops_functions.sql  функции и процедуры соп�
 sql/greenplum/03_checks.sql    проверки в редакции Greenplum + здоровье кластера
 dags/dq_runtime_dag.py         DQ каждые 30 минут, эскалация P1
 dags/mart_freshness_sla_dag.py SLA-контур готовности mart к 08:30
-tests/                         35 тестов: валидаторы, пороги, инциденты, e2e
+tests/                         930 тестов: валидаторы, каталог, пороги, отчёт, CLI, генератор, e2e
+tools/render_assets.py         PNG-таблицы и GIF для README (Pillow)
+docs/images/                   иллюстрации для README
 docs/                          архитектура, runbook, MPP-заметки, каталог проверок
 ```
 
 ## Тесты и CI
 
 ```bash
-python -m pytest -q            # локально
+python -m pytest -q            # 930 тестов
 make test                      # то же через Makefile
 make demo                      # сквозной сценарий
 ```
 
+Набор разложен по слоям, чтобы падение сразу указывало на место:
+
+| Файл | Тестов | Что проверяет |
+| --- | --- | --- |
+| `tests/test_inn_ogrn_matrix.py` | 310 | контрольные числа ИНН/ОГРН против эталонной реализации ФНС |
+| `tests/test_catalogue_matrix.py` | 219 | инварианты каталога + прогон каждой из 12 проверок на демо-хранилище |
+| `tests/test_bounds_matrix.py` | 140 | операторы `max`/`min`/`eq`, warn-зоны, `worst_status`, exit-коды |
+| `tests/test_synth_matrix.py` | 86 | детерминизм генератора и каждый внесённый дефект |
+| `tests/test_report_metrics_matrix.py` | 60 | форматирование отчёта, секции, экранирование меток Prometheus |
+| `tests/test_db_store_matrix.py` | 41 | макросы диалектов, плейсхолдеры, ops-таблицы |
+| `tests/test_cli_matrix.py` | 39 | разбор аргументов, коды возврата, тексты для дежурной смены |
+| `tests/test_validators.py` | 16 | известные ИНН/ОГРН и «похожие, но неверные» строки |
+| `tests/test_checks.py` | 10 | пороги, каталог, exit-коды |
+| `tests/test_incidents.py` | 6 | дедупликация, авто-закрытие, MTTR, SLA |
+| `tests/test_pipeline.py` | 3 | e2e: дефекты → инциденты → чистая перезаливка → MTTR |
+
 `tests/test_pipeline.py` поднимает хранилище с дефектами, проверяет, что каждая
 проверка поймала свой дефект, затем перезаливает данные чисто и проверяет, что
 все проверки позеленели, а инциденты закрылись с посчитанным MTTR.
+
+Иллюстрации для README пересобираются одной командой (нужен Pillow):
+
+```bash
+python tools/render_assets.py  # PNG-таблицы + GIF в docs/images/
+```
 
 CI (`.github/workflows/ci.yml`): матрица Python 3.10–3.13, `pytest`, сквозной
 `python run.py demo`, публикация отчёта и файла метрик как артефактов сборки.
