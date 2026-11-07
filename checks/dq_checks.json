@@ -116,7 +116,7 @@
       "unit": "ratio",
       "bounds": { "fail": { "min": 0.7 }, "warn": { "min": 0.85 } },
       "description": "Строк за последний день к медиане предыдущих 7 дней. Ловит частичную загрузку (упал источник, обрезался файл), когда свежесть формально в норме.",
-      "sql": "WITH daily AS (SELECT dt, COUNT(*) AS cnt FROM fct_account_turnover_daily GROUP BY dt), scored AS (SELECT dt, cnt, AVG(cnt) OVER (ORDER BY dt ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS baseline, ROW_NUMBER() OVER (ORDER BY dt DESC) AS rn FROM daily) SELECT COALESCE(ROUND(cnt * 1.0 / NULLIF(baseline, 0), 4), 0) AS metric_value, cnt AS rows_examined FROM scored WHERE rn = 1",
+      "sql": "WITH daily AS (SELECT dt, COUNT(*) AS cnt FROM fct_account_turnover_daily GROUP BY dt), ranked AS (SELECT dt, cnt, ROW_NUMBER() OVER (ORDER BY dt) AS pos FROM daily), pairs AS (SELECT r1.dt, r1.cnt, r2.cnt AS prev_cnt FROM ranked r1 JOIN ranked r2 ON r2.pos BETWEEN r1.pos - 7 AND r1.pos - 1), s AS (SELECT dt, cnt, prev_cnt, ROW_NUMBER() OVER (PARTITION BY dt ORDER BY prev_cnt) AS rn, COUNT(*) OVER (PARTITION BY dt) AS n FROM pairs), med AS (SELECT dt, AVG(prev_cnt) AS baseline FROM s WHERE rn IN ((n + 1) / 2, (n + 2) / 2) GROUP BY dt) SELECT COALESCE(ROUND(r.cnt * 1.0 / NULLIF(m.baseline, 0), 4), 0) AS metric_value, r.cnt AS rows_examined FROM ranked r LEFT JOIN med m ON m.dt = r.dt ORDER BY r.dt DESC LIMIT 1",
       "sample_sql": "SELECT dt, COUNT(*) AS rows_loaded FROM fct_account_turnover_daily GROUP BY dt ORDER BY dt DESC LIMIT 8",
       "tags": ["volume", "anomaly-detection"]
     },
